@@ -1,0 +1,85 @@
+# Builds ooi.exe and publishes a GitHub release.
+#
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# End users never build anything: they download the release asset (or run the
+# one-line install.ps1). This workflow is the only place a toolchain is needed.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build, e.g. v1.0.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # A C compiler for cgo. The decoder libraries themselves are vendored in
+      # third_party/, so nothing else is fetched.
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
+          $env:CGO_ENABLED = '1'; $env:CC = 'gcc'; $env:CXX = 'g++'
+          $ver = $env:TAG.TrimStart('v')
+          go build -trimpath -ldflags "-s -w -X main.version=$ver" -o ooi.exe .
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # Must depend only on DLLs every Windows install has.
+          $deps = objdump -p ooi.exe | Select-String 'DLL Name' | ForEach-Object { ($_ -split ':')[1].Trim() }
+          $deps
+          $bad = $deps | Where-Object { $_ -notin @('KERNEL32.dll','msvcrt.dll') }
+          if ($bad) { Write-Error "unexpected DLL dependencies: $bad"; exit 1 }
+          .\ooi.exe version
+
+      - name: Test (logic, decoders, crypto)
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
+          $env:CGO_ENABLED = '1'; $env:CC = 'gcc'; $env:CXX = 'g++'
+          go test -short ./internal/code/ ./internal/seal/ ./internal/jitter/ ./internal/gesture/ ./internal/vdec/ ./internal/install/ ./internal/rtc/ ./internal/frame/ ./internal/config/
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $lines = foreach ($f in 'ooi.exe','install.ps1') {
+            (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower() + '  ' + $f
+          }
+          [IO.File]::WriteAllLines("$PWD\SHA256SUMS.txt", $lines)
+          Get-Content SHA256SUMS.txt
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG ooi.exe install.ps1 SHA256SUMS.txt THIRD_PARTY_NOTICES.md --clobber
+          } else {
+            gh release create $env:TAG ooi.exe install.ps1 SHA256SUMS.txt THIRD_PARTY_NOTICES.md `
+              --title "OOI $env:TAG" --notes-file .github/release-notes.md
+          }

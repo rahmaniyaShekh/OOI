@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Share your screen</title>
+<style>
+  :root{
+    color-scheme:light dark;
+    --bg:#ffffff; --fg:#14181d; --muted:#5b646e; --line:#d6dbe1;
+    --field:#f6f7f9; --accent:#0b57d0; --ok:#1a7f37; --err:#b3261e;
+    --mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#0e1116; --fg:#e6edf3; --muted:#9aa4af; --line:#2a313c;
+          --field:#161b22; --accent:#7aa7ff; --ok:#3fb950; --err:#ff7b72}
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--fg);
+       font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+       padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  [hidden]{display:none !important}
+  .wrap{max-width:520px;margin:0 auto;padding:24px 16px;min-height:100%;display:flex;flex-direction:column;justify-content:center;gap:20px}
+  h1{font-size:22px;margin:0}
+  p.sub{margin:0;color:var(--muted)}
+  label{display:block;font-size:13px;color:var(--muted);margin:0 0 6px}
+  .code-input{width:100%;font:600 34px/1.2 var(--mono);letter-spacing:.14em;text-align:center;
+       text-transform:uppercase;padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--field);color:var(--fg)}
+  button{font:600 16px/1 inherit;padding:14px 18px;border:0;border-radius:12px;background:var(--accent);color:#fff;cursor:pointer;width:100%}
+  button.secondary{background:transparent;color:var(--accent);border:1px solid var(--line)}
+  button:disabled{opacity:.5;cursor:default}
+  .row{display:flex;gap:10px}
+  .card{border:1px solid var(--line);border-radius:12px;padding:14px;background:var(--field)}
+  .saved{display:flex;flex-direction:column;gap:8px}
+  .saved .item{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg)}
+  .saved .item .name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .saved .item .code{font:600 13px var(--mono);color:var(--muted)}
+  .iconbtn{width:auto;padding:8px 10px;background:transparent;color:var(--muted);border:1px solid var(--line);font-size:13px}
+  .status{display:flex;align-items:center;gap:10px;font-size:15px}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.wait{background:var(--accent);animation:pulse 1.2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .err{color:var(--err)}
+  .preview{width:100%;border-radius:12px;border:1px solid var(--line);background:#000;aspect-ratio:16/9;object-fit:contain}
+  .hint{font-size:13px;color:var(--muted)}
+  .stat{font:12px/1.4 var(--mono);color:var(--muted);white-space:pre-wrap}
+  select{font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--field);color:var(--fg)}
+</style>
+</head>
+<body>
+
+<div class="wrap" id="screen-join">
+  <div>
+    <h1>Share your screen</h1>
+    <p class="sub">Type the code from your friend's OOI window, then choose what to share.</p>
+  </div>
+
+  <div>
+    <label for="code">Connection code</label>
+    <input id="code" class="code-input" inputmode="latin" autocomplete="off" autocapitalize="characters"
+           spellcheck="false" placeholder="ABC-DEF" maxlength="7" aria-describedby="join-msg">
+  </div>
+
+  <div class="row">
+    <label class="hint" style="flex:1;margin:0">Quality
+      <select id="fps" aria-label="frame rate">
+        <option value="8" selected>8 fps · sharpest (recommended)</option>
+        <option value="5">5 fps · lowest bandwidth</option>
+        <option value="10">10 fps · smoother</option>
+        <option value="15">15 fps · fast connections</option>
+      </select>
+    </label>
+  </div>
+
+  <button id="connect" disabled>Choose what to share</button>
+  <div class="status" id="join-status" hidden><span class="dot wait"></span><span id="join-msg"></span></div>
+
+  <div id="saved-wrap" hidden>
+    <label>Reconnect to</label>
+    <div class="saved" id="saved"></div>
+  </div>
+
+  <p class="hint">Your screen goes straight to your friend's computer, encrypted end to end. This site only helps you connect and never sees your screen.</p>
+  <p class="err" id="compat" hidden></p>
+</div>
+
+<div class="wrap" id="screen-watch" hidden>
+  <div class="status"><span class="dot" id="watch-dot"></span><strong id="watch-title">Connecting…</strong></div>
+  <video class="preview" id="preview" autoplay muted playsinline></video>
+  <p class="hint" id="watch-detail">You can minimise this tab; sharing continues.</p>
+  <div class="card"><div class="stat" id="stats">—</div></div>
+  <button class="secondary" id="stop">Stop sharing</button>
+</div>
+
+<script>
+"use strict";
+// ---- mount + endpoints ----------------------------------------------------
+// The app is served under /ooi (a Worker route). base-uri is locked to 'none',
+// so a <base> tag is not allowed; the mount is computed instead.
+const MOUNT = location.pathname.startsWith('/ooi') ? '/ooi' : '';
+const api = p => MOUNT + p;
+
+// ---- join code ------------------------------------------------------------
+const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+const normalizeCode = s => (s||'').toUpperCase().split('').filter(c=>ALPHABET.includes(c)).join('');
+const prettyCode = c => c.length>3 ? c.slice(0,3)+'-'+c.slice(3) : c;
+async function roomIdFor(code){
+  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(code));
+  return [...new Uint8Array(h)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function newSession(){
+  return [...crypto.getRandomValues(new Uint8Array(8))].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+// ---- sealed blob (OOI1), byte-compatible with the native host -------------
+const PREFIX='OOI1:', MAGIC=[0x4f,0x4f,0x49,0x31], FLAG_ENC=1, SALT=16, IV=12, TAG=16, ITER=200000;
+const b64u = b=>{let s='';for(const x of b)s+=String.fromCharCode(x);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')};
+const unb64u = t=>{const n=t.replace(/-/g,'+').replace(/_/g,'/');const b=atob(n+'='.repeat((4-n.length%4)%4));return Uint8Array.from(b,c=>c.charCodeAt(0))};
+const pipe = (t,b)=>new Response(new Blob([b]).stream().pipeThrough(t)).arrayBuffer().then(a=>new Uint8Array(a));
+const cat = (...p)=>{const o=new Uint8Array(p.reduce((a,x)=>a+x.length,0));let k=0;for(const x of p){o.set(x,k);k+=x.length}return o};
+async function derive(pass,salt){
+  const m = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:ITER,hash:'SHA-256'}, m, {name:'AES-GCM',length:256}, false, ['encrypt','decrypt']);
+}
+async function sealBlob(sdp, code){
+  const body = await pipe(new CompressionStream('deflate-raw'), new TextEncoder().encode(sdp));
+  const salt = crypto.getRandomValues(new Uint8Array(SALT)), iv = crypto.getRandomValues(new Uint8Array(IV));
+  const head = cat(new Uint8Array(MAGIC), new Uint8Array([FLAG_ENC]), salt, iv);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:head,tagLength:TAG*8}, await derive(code,salt), body));
+  return PREFIX + b64u(cat(head, ct));
+}
+async function openBlob(blob, code){
+  const raw = unb64u(blob.trim().slice(PREFIX.length));
+  if (raw.length<5 || MAGIC.some((m,i)=>raw[i]!==m)) throw new Error('not a blob');
+  const hl = 5+SALT+IV, head = raw.subarray(0,hl);
+  let pt;
+  try{
+    pt = await crypto.subtle.decrypt({name:'AES-GCM',iv:raw.subarray(5+SALT,hl),additionalData:head,tagLength:TAG*8},
+      await derive(code, raw.subarray(5,5+SALT)), raw.subarray(hl));
+  }catch{ throw new Error('wrong code'); }
+  return new TextDecoder().decode(await pipe(new DecompressionStream('deflate-raw'), new Uint8Array(pt)));
+}
+
+// ---- saved codes ----------------------------------------------------------
+const STORE='ooi.hosts';
+const loadSaved = ()=>{try{const v=JSON.parse(localStorage.getItem(STORE)||'[]');return Array.isArray(v)?v.filter(e=>e&&typeof e.code==='string'):[]}catch{return[]}};
+const putSaved = l=>{try{localStorage.setItem(STORE,JSON.stringify(l.slice(0,12)))}catch{}};
+const findSaved = code=>loadSaved().find(e=>e.code===code);
+function rememberHost(code,name){
+  const list = loadSaved().filter(e=>e.code!==code);
+  list.unshift({code,name:(name||findSaved(code)?.name||'').trim(),at:Date.now()});
+  putSaved(list);
+  renderSaved();
+}
+function forgetHost(code){ putSaved(loadSaved().filter(e=>e.code!==code)); renderSaved(); }
+
+// ---- DOM ------------------------------------------------------------------
+const $ = id=>document.getElementById(id);
+const elCode=$('code'), elConnect=$('connect'), elJoinStatus=$('join-status'), elJoinMsg=$('join-msg');
+const elSavedWrap=$('saved-wrap'), elSaved=$('saved'), elFps=$('fps'), elCompat=$('compat');
+const elWatch=$('screen-watch'), elJoin=$('screen-join'), elPreview=$('preview');
+const elWatchTitle=$('watch-title'), elWatchDetail=$('watch-detail'), elWatchDot=$('watch-dot'), elStats=$('stats'), elStop=$('stop');
+
+function showJoin(msg,isErr){
+  elWatch.hidden=true; elJoin.hidden=false;
+  if(msg){ elJoinStatus.hidden=false; elJoinMsg.textContent=msg; elJoinMsg.className=isErr?'err':''; }
+  else elJoinStatus.hidden=true;
+  elConnect.disabled = normalizeCode(elCode.value).length!==6;
+}
+function joinStatus(msg,kind){
+  elJoinStatus.hidden=false; elJoinMsg.textContent=msg; elJoinMsg.className='';
+  const dot=elJoinStatus.querySelector('.dot'); dot.className='dot '+(kind||'wait');
+}
+function showWatch(){ elJoin.hidden=true; elWatch.hidden=false; }
+function watchStatus(title,detail,kind){
+  elWatchTitle.textContent=title;
+  if(detail!=null) elWatchDetail.textContent=detail;
+  elWatchDot.className='dot '+(kind||'wait');
+}
+
+elCode.addEventListener('input',()=>{
+  const n=normalizeCode(elCode.value).slice(0,6);
+  elCode.value=prettyCode(n);
+  elConnect.disabled=n.length!==6;
+});
+elCode.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!elConnect.disabled) start(normalizeCode(elCode.value)); });
+elConnect.addEventListener('click',()=>start(normalizeCode(elCode.value)));
+elStop.addEventListener('click',()=>{ stop(); showJoin(); });
+
+function renderSaved(){
+  const list=loadSaved();
+  elSavedWrap.hidden=list.length===0;
+  elSaved.innerHTML='';
+  for(const e of list){
+    const item=document.createElement('div'); item.className='item';
+    const b=document.createElement('button'); b.className='iconbtn'; b.style.flex='1'; b.style.textAlign='left';
+    b.innerHTML=`<span class="name">${escapeHtml(e.name||prettyCode(e.code))}</span> <span class="code">${prettyCode(e.code)}</span>`;
+    b.onclick=()=>{ elCode.value=prettyCode(e.code); elConnect.disabled=false; start(e.code); };
+    const ren=document.createElement('button'); ren.className='iconbtn'; ren.textContent='Rename';
+    ren.onclick=()=>{ const n=prompt('Name for this connection:',e.name||''); if(n!=null){ rememberHost(e.code,n); } };
+    const del=document.createElement('button'); del.className='iconbtn'; del.textContent='Remove';
+    del.onclick=()=>forgetHost(e.code);
+    item.append(b,ren,del); elSaved.appendChild(item);
+  }
+}
+function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+// ---- connection driver (joiner = answerer) --------------------------------
+const ICE = { iceServers:[{urls:['stun:stun.cloudflare.com:3478','stun:stun.l.google.com:19302']}] };
+const ATTEMPT_TIMEOUT=25000, GATHER_TIMEOUT=8000, SESSION_COOLDOWN=30000;
+const sleep = ms=>new Promise(r=>setTimeout(r,ms));
+let generation=0, wakeLock=null, shareStream=null;
+
+async function start(code){
+  code = normalizeCode(code);
+  if(code.length!==6) return;
+  // Capture the screen up front, once, so a reconnect reuses the same stream
+  // and the user is not re-prompted on every host restart.
+  if(!shareStream){
+    try{
+      shareStream = await navigator.mediaDevices.getDisplayMedia({
+        video:{ frameRate:{ ideal:Number(elFps.value), max:Number(elFps.value) } },
+        audio:false
+      });
+    }catch(e){ showJoin('Screen share was cancelled.',true); return; }
+    // If the user stops sharing from the browser's own control, end cleanly.
+    shareStream.getVideoTracks()[0].addEventListener('ended',()=>{ stop(); showJoin('Screen sharing ended.'); });
+  }
+  showWatch();
+  const gen=++generation;
+  driver(code, gen).catch(e=>{ if(gen===generation){ showJoin(e.message||'Connection failed.',true);} });
+}
+function stop(){
+  generation++;
+  if(shareStream){ shareStream.getTracks().forEach(t=>t.stop()); shareStream=null; }
+  releaseWake();
+}
+
+async function getOffer(id){
+  const r=await fetch(api(`/api/room/${id}`),{cache:'no-store'});
+  if(r.status===404) return null;
+  if(!r.ok) throw new Error('server');
+  return r.json();
+}
+
+async function driver(code, gen){
+  const id=await roomIdFor(code);
+  const known=Boolean(findSaved(code));
+  const spent=new Map();
+  let everConnected=false, waitingSince=Date.now();
+
+  while(gen===generation){
+    let room;
+    try{ room=await getOffer(id); }
+    catch{ watchStatus('Waiting for the network…',null,'wait'); await sleep(2000); continue; }
+    if(gen!==generation) return;
+
+    if(!room){
+      if(!everConnected && !known && Date.now()-waitingSince>15000){
+        stop(); showJoin('Nobody is using that code. Check it and try again.',true); return;
+      }
+      watchStatus(known||everConnected?'Waiting for your friend to be ready…':'Looking for your friend…',
+                  'Their OOI window must be running.','wait');
+      await sleep(1500); continue;
+    }
+    const lost=spent.get(room.session);
+    if(lost && Date.now()-lost<SESSION_COOLDOWN){ await sleep(1000); continue; }
+
+    const outcome=await attempt(id, code, room, gen, ()=>{
+      everConnected=true; rememberHost(code);
+    });
+    if(gen!==generation) return;
+    if(outcome==='badcode'){ stop(); showJoin('That code is not right.',true); return; }
+    if(outcome!=='stale'){ spent.set(room.session,Date.now()); await sleep(500); }
+    waitingSince=Date.now();
+  }
+}
+
+async function attempt(id, code, room, gen, onLive){
+  let offerSDP;
+  try{ offerSDP=await openBlob(room.offer, code); }catch{ return 'badcode'; }
+
+  const pc=new RTCPeerConnection(ICE);
+  const done=deferred();
+  pc.onconnectionstatechange=()=>{
+    const s=pc.connectionState;
+    if(s==='connected') watchStatus('Sharing your screen','Your friend can see this now. You can minimise the tab.','ok');
+    if(s==='failed'||s==='closed') done.resolve('failed');
+    if(s==='disconnected'){ watchStatus('Connection interrupted…','Trying to recover.','wait'); }
+  };
+
+  try{
+    await pc.setRemoteDescription({type:'offer',sdp:offerSDP});
+    // Attach the screen track to the recvonly transceiver the host offered.
+    for(const track of shareStream.getVideoTracks()){
+      track.contentHint='detail'; // screen content: preserve sharpness over motion
+      pc.addTrack(track, shareStream);
+    }
+    await pc.setLocalDescription(await pc.createAnswer());
+    tuneEncoding(pc, Number(elFps.value));
+    await gatherComplete(pc, GATHER_TIMEOUT);
+    if(gen!==generation){ pc.close(); return 'aborted'; }
+
+    const answer=await sealBlob(pc.localDescription.sdp, code);
+    const post=await fetch(api(`/api/room/${id}/answer`),{method:'POST',
+      headers:{'content-type':'application/json'}, body:JSON.stringify({answer, session:room.session})});
+    if(post.status===409){ pc.close(); return 'stale'; }
+    if(!post.ok){ pc.close(); return 'failed'; }
+
+    const timer=setTimeout(()=>done.resolve('timeout'), ATTEMPT_TIMEOUT);
+    const watch=setInterval(()=>{ if(pc.connectionState==='connected') done.resolve('connected'); },250);
+    const supersede=setInterval(async()=>{
+      try{ const now=await getOffer(id); if(!now||now.session!==room.session) done.resolve('stale'); }catch{}
+    },2000);
+
+    const why=await done.promise;
+    clearTimeout(timer); clearInterval(watch); clearInterval(supersede);
+    if(gen!==generation || why!=='connected'){ pc.close(); return why==='stale'?'stale':'failed'; }
+
+    onLive();
+    await requestWake();
+    showPreview();
+    startStats(pc);
+    await new Promise(r=>{ pc.onconnectionstatechange=()=>['failed','disconnected','closed'].includes(pc.connectionState)&&r(); });
+    stopStats(); pc.close();
+    return 'connected';
+  }catch(e){ try{pc.close()}catch{}; return 'failed'; }
+}
+
+// tuneEncoding is where quality on a slow link is decided.
+function tuneEncoding(pc, fps){
+  for(const sender of pc.getSenders()){
+    if(!sender.track || sender.track.kind!=='video') continue;
+    const p=sender.getParameters();
+    if(!p.encodings || !p.encodings.length) p.encodings=[{}];
+    // Preserve resolution/sharpness; shed frame rate first when bandwidth is
+    // tight. This is the "keep a high-quality frame, drop fps" behaviour.
+    p.degradationPreference='maintain-resolution';
+    p.encodings[0].maxFramerate=fps;
+    // A high ceiling the congestion controller is free to use when the link is
+    // good, and to back away from automatically when it is not — so quality
+    // rises on fast connections and holds together on slow ones.
+    p.encodings[0].maxBitrate=8_000_000;
+    p.encodings[0].scaleResolutionDownBy=1;
+    sender.setParameters(p).catch(()=>{});
+  }
+}
+
+function showPreview(){
+  try{ elPreview.srcObject=shareStream; }catch{}
+}
+
+// ---- live stats -----------------------------------------------------------
+let statsTimer=null;
+function startStats(pc){
+  stopStats();
+  let lastBytes=0, lastTs=0;
+  statsTimer=setInterval(async()=>{
+    let line='';
+    try{
+      const rep=await pc.getStats();
+      rep.forEach(s=>{
+        if(s.type==='outbound-rtp' && s.kind==='video'){
+          const now=s.timestamp, bytes=s.bytesSent||0;
+          let kbps=0;
+          if(lastTs) kbps=Math.round((bytes-lastBytes)*8/(now-lastTs));
+          lastBytes=bytes; lastTs=now;
+          const w=s.frameWidth||0, h=s.frameHeight||0, fps=Math.round(s.framesPerSecond||0);
+          line=`${w}×${h}  ${fps} fps  ${kbps} kbps\ncodec ${(s.codecId?'':'')}sent ${(bytes/1048576).toFixed(1)} MiB`;
+        }
+      });
+      rep.forEach(s=>{ if(s.type==='candidate-pair'&&s.nominated&&s.currentRoundTripTime!=null) line+=`  rtt ${Math.round(s.currentRoundTripTime*1000)} ms`; });
+    }catch{}
+    if(line) elStats.textContent=line;
+  },1000);
+}
+function stopStats(){ if(statsTimer){ clearInterval(statsTimer); statsTimer=null; } }
+
+// ---- helpers --------------------------------------------------------------
+function gatherComplete(pc,ms){
+  if(pc.iceGatheringState==='complete') return Promise.resolve();
+  return new Promise(res=>{
+    const t=setTimeout(fin,ms);
+    function fin(){ clearTimeout(t); pc.removeEventListener('icegatheringstatechange',chk); res(); }
+    function chk(){ if(pc.iceGatheringState==='complete') fin(); }
+    pc.addEventListener('icegatheringstatechange',chk);
+  });
+}
+function deferred(){ let r,s=false; const p=new Promise(x=>r=x); return {promise:p,resolve:v=>{if(!s){s=true;r(v)}}}; }
+async function requestWake(){ try{ wakeLock=await navigator.wakeLock?.request('screen'); }catch{} }
+function releaseWake(){ try{ wakeLock?.release(); }catch{} wakeLock=null; }
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible' && !wakeLock && !elWatch.hidden) requestWake(); });
+
+// ---- boot -----------------------------------------------------------------
+function boot(){
+  if(typeof RTCPeerConnection==='undefined' || !navigator.mediaDevices?.getDisplayMedia){
+    elCompat.hidden=false; elCompat.textContent='This browser cannot share a screen. Use desktop Chrome, Edge or Firefox.';
+    elConnect.disabled=true; return;
+  }
+  if(typeof DecompressionStream==='undefined'){
+    elCompat.hidden=false; elCompat.textContent='This browser is too old (no DecompressionStream). Please update it.';
+    elConnect.disabled=true; return;
+  }
+  renderSaved();
+  // Deep link: /ooi/#ABC-DEF (fragment is never sent to the server).
+  const frag=normalizeCode(location.hash.slice(1));
+  if(frag.length===6){
+    elCode.value=prettyCode(frag); elConnect.disabled=false;
+    if(findSaved(frag)) start(frag); // known code: reconnect straight away
+  }
+  elCode.focus();
+}
+boot();
+</script>
+</body>
+</html>

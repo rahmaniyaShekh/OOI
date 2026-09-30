@@ -1,0 +1,6 @@
+/ooi.exe
+/overlayc.exe
+/third_party/pkgcache/
+/rendezvous/node_modules/
+/rendezvous/.wrangler/
+*.log

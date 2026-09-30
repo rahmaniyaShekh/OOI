@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ooi-connect",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+
+  // Static assets serve the joiner page. run_worker_first sends EVERY request
+  // through the Worker, so the security headers and the /ooi prefix stripping
+  // are never bypassed by the edge serving an asset directly.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // Serve the exact path the Worker asks for. Without this the asset layer
+    // 307-redirects /index.html -> /, which under the /ooi prefix escapes to
+    // the site root (a different Worker) instead of staying inside /ooi.
+    "html_handling": "none",
+    "run_worker_first": true
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "Room" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] }
+  ],
+
+  // A PATH route, not a custom domain: it runs before the custom-domain Worker
+  // already on share.mdarif.online, so that site is untouched and only /ooi* is
+  // handled here.
+  "routes": [
+    { "pattern": "share.mdarif.online/ooi*", "zone_name": "mdarif.online" }
+  ],
+
+  "workers_dev": true,
+  "observability": { "enabled": true }
+}
