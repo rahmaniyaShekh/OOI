@@ -9,32 +9,44 @@ anything else that records the desktop through Windows' own APIs.
 ## Install
 
 **Windows 11** (or Windows 10 build 19041+). No admin rights, and **nothing else
-to install** — no Go, no compiler, no runtime. Open PowerShell and run:
+to install**: no Go, no compiler, no runtime. The release is one prebuilt,
+self-contained `ooi.exe`. The repository is private, so downloading needs your
+GitHub access.
+
+**Easiest: browser + double-click**
+
+1. Sign in to GitHub and open the latest
+   [release](https://github.com/rahmaniyaShekh/OOI/releases/latest).
+2. Download `ooi.exe` and **double-click it**.
+
+It installs itself to `%LOCALAPPDATA%\Programs\ooi`, adds that folder to your
+user PATH, and prints **your code**.
+
+**Or from PowerShell** (with a read-only GitHub token, see [SETUP.md](SETUP.md#get-a-github-token)):
 
 ```powershell
-irm https://github.com/rahmaniyaShekh/OOI/releases/latest/download/install.ps1 | iex
+$env:OOI_GITHUB_TOKEN = 'github_pat_...'
+irm https://api.github.com/repos/rahmaniyaShekh/OOI/contents/install.ps1 -Headers @{Authorization="Bearer $env:OOI_GITHUB_TOKEN"; Accept='application/vnd.github.raw'} | iex
 ```
 
-That downloads the prebuilt `ooi.exe` from the latest
-[release](https://github.com/rahmaniyaShekh/OOI/releases/latest), checks its
-SHA-256, puts it in `%LOCALAPPDATA%\Programs\ooi`, adds that folder to your user
-PATH, and prints **your code**.
-
-Prefer clicking? Download `ooi.exe` from the release page and **double-click
-it** — it installs itself the same way.
+This also saves the token encrypted for your Windows account, so `ooi update`
+needs nothing more.
 
 ## Use
 
 Everything runs from a terminal:
 
 ```powershell
-ooi serve --detach   # start in the background; prints the link for your friend
+ooi start            # start in the background (the default); prints the link
 ooi status           # your code, connection, protection state, video stats
 ooi stop             # stop it
 ooi verify           # prove capture protection works on this PC
 ooi update           # install the newest release (SHA-256 verified)
 ooi uninstall        # remove it (keeps your code; --purge deletes it)
 ```
+
+`ooi start --foreground` keeps it in the terminal with a live log. In the
+background it logs to `%LOCALAPPDATA%\ooi\ooi.log`.
 
 Send your friend the printed link, e.g. `https://share.mdarif.online/ooi/#QZD-EB4`.
 They open it in Chrome/Edge/Firefox, click **Choose what to share**, and your
@@ -51,7 +63,7 @@ shared by every install — there is nothing to deploy.
 
 ## How the connection works
 
-One side (you) runs `ooi serve`. It shows a persistent 6-character code such as
+One side (you) runs `ooi start`. It shows a persistent 6-character code such as
 `K7Q-4MX`. Your friend opens **https://share.mdarif.online/ooi**, types the code
 (or opens the link, which fills it in), picks a window or screen to share, and
 within a second or two their screen is in your overlay — flowing **directly
@@ -77,7 +89,7 @@ between the two machines**, encrypted end to end.
   plaintext.
 * The **code belongs to your device**. It survives restarts, so your friend
   rejoins tomorrow with nothing re-sent. Rotate it any time with
-  `ooi serve --new-code` (or `ooi code --new`) to revoke old access.
+  `ooi start --new-code` (or `ooi code --new`) to revoke old access.
 * The only server is a tiny Cloudflare Worker that swaps ~1 KB of encrypted
   connection data and then leaves the path. The full pattern is in
   [P2P_SHORT_CODE_CONNECT.md](P2P_SHORT_CODE_CONNECT.md).
@@ -209,7 +221,7 @@ disable gestures with `--no-gestures`.
 ## Flags
 
 ```
-ooi serve
+ooi start   (alias: serve)
   --geometry 1280x720      overlay size, or WxH+X+Y for an explicit position
   --opacity 235            1-255
   --codecs vp9,av1,vp8,h264   codec preference offered to the browser
@@ -222,7 +234,8 @@ ooi serve
   --click-through          let mouse clicks pass through (default true)
   --no-hotkeys             do not register global hotkeys
   --no-gestures            disable touchpad gesture control
-  --detach                 run in the background
+  --foreground             stay in this terminal with a live log (default: background)
+  --log-file <path>        log to a file (the background default is %LOCALAPPDATA%\ooi\ooi.log)
   --quiet                  suppress the log stream
 ```
 

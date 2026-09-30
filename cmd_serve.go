@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,21 +31,23 @@ func cmdServe(args []string) error {
 	fs.SetOutput(os.Stderr)
 
 	var (
-		geom      = fs.String("geometry", "1280x720", "overlay size and position: WxH or WxH+X+Y (physical pixels)")
-		opacity   = fs.Int("opacity", 235, "overlay opacity, 1-255")
-		service   = fs.String("service", rendezvous.DefaultService, "rendezvous base URL")
-		codecs    = fs.String("codecs", "", "codec preference, comma separated (vp9,av1,vp8,h264); default vp9,av1,vp8,h264")
-		threads   = fs.Int("threads", 0, "decoder threads (0 = auto)")
-		turn      = fs.String("turn", "", "TURN server URL (turn:host:port), used only when a direct path fails")
-		turnUser  = fs.String("turn-user", "", "TURN username")
-		turnPass  = fs.String("turn-pass", "", "TURN credential")
-		noStun    = fs.Bool("no-stun", false, "do not use public STUN (LAN-only, no external contact)")
-		clickThru = fs.Bool("click-through", true, "let mouse clicks pass through the overlay")
-		noHotkeys = fs.Bool("no-hotkeys", false, "do not register global hotkeys")
-		noGesture = fs.Bool("no-gestures", false, "disable touchpad gesture control")
-		newCode   = fs.Bool("new-code", false, "rotate the join code before starting")
-		detach    = fs.Bool("detach", false, "run in the background and return to the prompt")
-		quiet     = fs.Bool("quiet", false, "suppress the log stream")
+		geom       = fs.String("geometry", "1280x720", "overlay size and position: WxH or WxH+X+Y (physical pixels)")
+		opacity    = fs.Int("opacity", 235, "overlay opacity, 1-255")
+		service    = fs.String("service", rendezvous.DefaultService, "rendezvous base URL")
+		codecs     = fs.String("codecs", "", "codec preference, comma separated (vp9,av1,vp8,h264); default vp9,av1,vp8,h264")
+		threads    = fs.Int("threads", 0, "decoder threads (0 = auto)")
+		turn       = fs.String("turn", "", "TURN server URL (turn:host:port), used only when a direct path fails")
+		turnUser   = fs.String("turn-user", "", "TURN username")
+		turnPass   = fs.String("turn-pass", "", "TURN credential")
+		noStun     = fs.Bool("no-stun", false, "do not use public STUN (LAN-only, no external contact)")
+		clickThru  = fs.Bool("click-through", true, "let mouse clicks pass through the overlay")
+		noHotkeys  = fs.Bool("no-hotkeys", false, "do not register global hotkeys")
+		noGesture  = fs.Bool("no-gestures", false, "disable touchpad gesture control")
+		newCode    = fs.Bool("new-code", false, "rotate the join code before starting")
+		foreground = fs.Bool("foreground", false, "stay in this terminal with a live log (default: run in the background)")
+		_          = fs.Bool("detach", true, "run in the background (the default; kept for compatibility)")
+		logFile    = fs.String("log-file", "", "write the log to this file instead of the terminal")
+		quiet      = fs.Bool("quiet", false, "suppress the log stream")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `ooi serve - start the receiver
@@ -92,7 +95,9 @@ Capture protection is always on and cannot be disabled here.
 		return err
 	}
 
-	if *detach {
+	// Background is the default: start, print the link, return the prompt.
+	// The relaunched child gets --foreground so it does not detach again.
+	if !*foreground {
 		return runDetached(args)
 	}
 
@@ -115,7 +120,7 @@ Capture protection is always on and cannot be disabled here.
 	return runServe(serveParams{
 		geom: g, opacity: *opacity, service: *service, order: order, threads: *threads,
 		ice: iceServers, clickThru: *clickThru, hotkeys: !*noHotkeys, gestures: !*noGesture,
-		code: joinCode, quiet: *quiet, dir: dir,
+		code: joinCode, quiet: *quiet, dir: dir, logFile: *logFile,
 	})
 }
 
@@ -131,6 +136,7 @@ type serveParams struct {
 	gestures  bool
 	code      string
 	quiet     bool
+	logFile   string
 	dir       string
 }
 
@@ -156,9 +162,18 @@ func buildICE(noStun bool, turn, user, pass string) []webrtc.ICEServer {
 
 func runServe(p serveParams) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags)
+	if p.logFile != "" {
+		// Truncated on each start so it cannot grow without bound.
+		if f, err := os.OpenFile(p.logFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600); err == nil {
+			defer f.Close()
+			logger = log.New(f, "", log.LstdFlags)
+		}
+	}
 	if p.quiet {
 		logger = log.New(io.Discard, "", 0)
 	}
+	logger.Printf("ooi %s starting: code %s, service %s, overlay %dx%d", version,
+		code.Pretty(p.code), p.service, p.geom.W, p.geom.H)
 
 	ov := overlay.New(overlay.Config{
 		X: p.geom.X, Y: p.geom.Y, W: p.geom.W, H: p.geom.H,
@@ -212,7 +227,7 @@ func runServe(p serveParams) error {
 	}
 	defer procctl.Clear(p.dir)
 
-	if !p.quiet {
+	if !p.quiet && p.logFile == "" {
 		printBanner(p, rz.JoinURL(code.Pretty(p.code)))
 	}
 
@@ -299,39 +314,58 @@ func codecList(order []vdec.Codec) string {
 	return strings.Join(names, " > ")
 }
 
-// runDetached relaunches without --detach and reports the child's code.
+// runDetached relaunches this exe in the background with --foreground and a
+// log file, waits for it to publish its state, and prints the link.
 func runDetached(args []string) error {
 	dir, err := procctl.Dir()
 	if err != nil {
 		return err
 	}
 	if s, err := procctl.Load(dir); err == nil {
-		return fmt.Errorf("already running (pid %d) - run `ooi stop` first", s.PID)
+		fmt.Printf("ooi is already running (pid %d)\n\n", s.PID)
+		printLink(s.URL)
+		fmt.Println("  ooi status    code, connection and protection state")
+		fmt.Println("  ooi stop      stop it")
+		return nil
 	}
-	child := make([]string, 0, len(args)+1)
-	child = append(child, "serve")
+	logPath := filepath.Join(dir, "ooi.log")
+	child := []string{"serve"}
 	for _, a := range args {
-		if a == "--detach" || a == "-detach" || a == "--detach=true" || a == "-detach=true" {
+		switch strings.TrimLeft(a, "-") {
+		case "detach", "detach=true", "detach=false", "foreground", "foreground=false":
 			continue
 		}
 		child = append(child, a)
 	}
+	child = append(child, "--foreground", "--log-file", logPath)
+
 	pid, err := procctl.Detach(child)
 	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if s, err := procctl.Load(dir); err == nil && s.PID == pid {
-			fmt.Printf("ooi started in the background (pid %d)\n\n", pid)
-			fmt.Println("  Send your friend this link:")
-			fmt.Println("\n      " + s.URL + "\n")
-			fmt.Println("  Stop it with:  ooi stop")
+			fmt.Printf("ooi is running in the background (pid %d)\n\n", pid)
+			printLink(s.URL)
+			fmt.Println("  ooi status    code, connection and protection state")
+			fmt.Println("  ooi stop      stop it")
+			fmt.Println("  log           " + logPath)
 			return nil
+		}
+		if !procctl.Alive(pid) {
+			return fmt.Errorf("ooi exited during startup; see %s", logPath)
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
-	return fmt.Errorf("started pid %d but it did not come up within 10s - check `ooi status`", pid)
+	return fmt.Errorf("started pid %d but it did not come up within 15s; see %s", pid, logPath)
+}
+
+func printLink(url string) {
+	fmt.Println("  Send your friend this link:")
+	fmt.Println()
+	fmt.Println("      " + url)
+	fmt.Println()
 }
 
 // defaultPosition centres the overlay near the top of the primary monitor.

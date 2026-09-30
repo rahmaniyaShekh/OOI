@@ -5,26 +5,40 @@
 **Needs:** Windows 11 (or Windows 10 build 19041+), 64-bit. That is all — no
 administrator rights, no Go, no compiler, no runtime, no DLLs.
 
-### Option 1 — one line in PowerShell (recommended)
+The repository is **private**, so GitHub only hands the release to someone
+signed in, or holding a token. Pick one:
 
-```powershell
-irm https://github.com/rahmaniyaShekh/OOI/releases/latest/download/install.ps1 | iex
-```
+### Option 1: browser + double-click (no token needed)
 
-### Option 2 — download and double-click
-
-1. Open <https://github.com/rahmaniyaShekh/OOI/releases/latest>.
+1. Sign in to GitHub and open <https://github.com/rahmaniyaShekh/OOI/releases/latest>.
 2. Download `ooi.exe`.
 3. Double-click it. If Windows SmartScreen says "Windows protected your PC",
-   click **More info → Run anyway** (the exe is not code-signed).
+   click **More info, then Run anyway** (the exe is not code-signed).
 
-### Option 3 — from a terminal, with a downloaded exe
+Or run the downloaded file from a terminal: `.\ooi.exe install`.
+
+### Option 2: one command in PowerShell (with a token)
 
 ```powershell
-.\ooi.exe install
+$env:OOI_GITHUB_TOKEN = 'github_pat_...'
+irm https://api.github.com/repos/rahmaniyaShekh/OOI/contents/install.ps1 -Headers @{Authorization="Bearer $env:OOI_GITHUB_TOKEN"; Accept='application/vnd.github.raw'} | iex
 ```
 
-All three do the same thing:
+This one also saves the token (encrypted for your Windows account), so
+`ooi update` works with no further input.
+
+### Get a GitHub token
+
+Needed only for Option 2 and for `ooi update`. Create it once at
+<https://github.com/settings/personal-access-tokens/new>:
+
+- **Repository access:** Only select repositories, then **OOI**
+- **Permissions:** Contents, **Read-only** (nothing else)
+
+ooi stores it with Windows DPAPI in `%LOCALAPPDATA%\ooi\github.token`. Only your
+Windows account on this PC can decrypt it. `ooi update --forget-token` deletes it.
+
+Either way:
 
 | | |
 |---|---|
@@ -40,7 +54,7 @@ The install path never changes, so PATH stays correct through every update.
 
 ```powershell
 ooi verify           # once: prove capture protection works on this PC
-ooi serve --detach   # start in the background; prints the link
+ooi start            # start in the background (the default); prints the link
 ooi status           # code, link, connection, protection state, video stats
 ooi stop             # stop it
 ```
@@ -50,8 +64,8 @@ Send your friend the link it prints (for example
 **share.mdarif.online/ooi** in desktop Chrome, Edge, Brave or Firefox, enter the
 code, and pick what to share. They install nothing.
 
-Run `ooi serve` without `--detach` to keep it in the foreground with a live log;
-`Ctrl+C` or `Ctrl+Alt+Q` stops it.
+`ooi start --foreground` keeps it in this terminal with a live log (`Ctrl+C` or
+`Ctrl+Alt+Q` stops it). In the background it logs to `%LOCALAPPDATA%\ooi\ooi.log`.
 
 ### Your code
 
@@ -73,6 +87,7 @@ computers.
 
 ```powershell
 ooi update             # download the newest release, verify SHA-256, replace in place
+                       # (asks once for a GitHub token if none is saved)
 ooi update --check     # just report whether one exists
 ooi uninstall          # remove the exe and the PATH entry (keeps your code)
 ooi uninstall --purge  # also delete your code and state
@@ -92,7 +107,7 @@ behind strict carrier-grade NAT there is no direct path, and a TURN relay is
 needed:
 
 ```powershell
-ooi serve --turn turn:your.turn.host:3478 --turn-user USER --turn-pass PASS
+ooi start --turn turn:your.turn.host:3478 --turn-user USER --turn-pass PASS
 ```
 
 TURN only relays the already-encrypted stream; it cannot read it.

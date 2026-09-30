@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"ooi/internal/install"
 	"ooi/internal/procctl"
 	"ooi/internal/rendezvous"
+
+	"golang.org/x/sys/windows"
 )
 
 // cmdInstall copies this exe to %LOCALAPPDATA%\Programs\ooi and puts that
@@ -24,6 +27,7 @@ import (
 func cmdInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	ghToken := fs.String("github-token", "", "save a read-only GitHub token (encrypted) so `ooi update` can reach the private repo")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `ooi install - install ooi for the current user
 
@@ -48,6 +52,21 @@ Safe to run again: it replaces the installed copy with this one.
 	if err != nil {
 		return err
 	}
+	// A token can come from the flag, or from OOI_GITHUB_TOKEN (how install.ps1
+	// passes it, so it never appears on a command line). Saved encrypted.
+	tok := strings.TrimSpace(*ghToken)
+	if tok == "" {
+		tok = strings.TrimSpace(os.Getenv("OOI_GITHUB_TOKEN"))
+	}
+	tokenSaved := false
+	if tok != "" {
+		if dir, err := procctl.Dir(); err == nil {
+			if err := install.SaveToken(dir, tok); err != nil {
+				return err
+			}
+			tokenSaved = true
+		}
+	}
 
 	fmt.Println()
 	fmt.Println("  ooi installed")
@@ -58,6 +77,9 @@ Safe to run again: it replaces the installed copy with this one.
 		fmt.Println("  PATH       added (for your user account)")
 	default:
 		fmt.Println("  PATH       already set")
+	}
+	if tokenSaved {
+		fmt.Println("  updates    GitHub token saved (encrypted) - `ooi update` needs nothing more")
 	}
 	// The code is created now, not on first serve, so the user can hand it to
 	// their friend straight away. It is kept across updates and reinstalls.
@@ -75,13 +97,13 @@ Safe to run again: it replaces the installed copy with this one.
 	}
 	fmt.Println()
 	fmt.Println("    ooi verify          check capture protection on this PC")
-	fmt.Println("    ooi serve --detach  start in the background, prints the link for your friend")
+	fmt.Println("    ooi start           start in the background, prints the link for your friend")
 	fmt.Println("    ooi status          see the code, connection and protection state")
 	fmt.Println("    ooi stop            stop it")
 	fmt.Println("    ooi update          get the latest release")
 	fmt.Println()
 	if wasRunning {
-		fmt.Println("  (a running instance was stopped; start it again with `ooi serve --detach`)")
+		fmt.Println("  (a running instance was stopped; start it again with `ooi start`)")
 		fmt.Println()
 	}
 	return nil
@@ -113,18 +135,71 @@ func cmdUpdate(args []string) error {
 	fs.SetOutput(os.Stderr)
 	force := fs.Bool("force", false, "reinstall even if already on the latest version")
 	check := fs.Bool("check", false, "only report whether an update is available")
+	tokenFlag := fs.String("token", "", "GitHub token with read access to the repo (saved encrypted for next time)")
+	forget := fs.Bool("forget-token", false, "delete the saved GitHub token and exit")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `ooi update - install the latest release from GitHub
+
+The OOI repository is private, so GitHub needs a token to hand out the release.
+Create one once at  https://github.com/settings/personal-access-tokens/new :
+  Repository access: Only select repositories -> OOI
+  Permissions:       Contents -> Read-only
+It is saved encrypted for your Windows account (DPAPI) and reused.
+
+FLAGS
+`)
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	dataDir, err := procctl.Dir()
+	if err != nil {
+		return err
+	}
+	if *forget {
+		if err := install.ForgetToken(dataDir); err != nil {
+			return err
+		}
+		fmt.Println("saved GitHub token deleted")
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	token := strings.TrimSpace(*tokenFlag)
+	saveIt := token != ""
+	if token == "" {
+		token, _ = install.Token(dataDir)
+	}
+
 	fmt.Println("checking https://github.com/" + install.Repo + " ...")
-	rel, err := install.Latest(ctx)
+	rel, err := install.Latest(ctx, token)
+	if (errors.Is(err, install.ErrPrivate) || errors.Is(err, install.ErrBadToken)) && isTerminal() {
+		fmt.Println()
+		fmt.Println("  " + err.Error())
+		fmt.Println("  Create a token at https://github.com/settings/personal-access-tokens/new")
+		fmt.Println("  (Only select repositories: OOI; Permissions: Contents = Read-only).")
+		fmt.Print("  Paste it here (hidden, Enter to cancel): ")
+		token = readHidden()
+		fmt.Println()
+		if token == "" {
+			return errors.New("update cancelled")
+		}
+		saveIt = true
+		rel, err = install.Latest(ctx, token)
+	}
 	if err != nil {
 		return err
 	}
+	if saveIt {
+		if err := install.SaveToken(dataDir, token); err != nil {
+			return err
+		}
+		fmt.Println("  token saved (encrypted for this Windows user)")
+	}
+
 	current := "v" + strings.TrimPrefix(version, "v")
 	fmt.Printf("  installed %s, latest %s\n", current, rel.Tag)
 	if rel.Tag == current && !*force {
@@ -137,7 +212,7 @@ func cmdUpdate(args []string) error {
 	}
 
 	fmt.Println("  downloading and verifying (SHA-256) ...")
-	tmp, err := install.Download(ctx, rel)
+	tmp, err := install.Download(ctx, rel, token)
 	if err != nil {
 		return err
 	}
@@ -150,9 +225,27 @@ func cmdUpdate(args []string) error {
 	}
 	fmt.Printf("  updated to %s at %s\n", rel.Tag, res.Target)
 	if wasRunning {
-		fmt.Println("  the running instance was stopped; start it again with `ooi serve --detach`")
+		fmt.Println("  the running instance was stopped; start it again with `ooi start`")
 	}
 	return nil
+}
+
+// isTerminal reports whether stdin is an interactive console.
+func isTerminal() bool {
+	var mode uint32
+	return windows.GetConsoleMode(windows.Handle(os.Stdin.Fd()), &mode) == nil
+}
+
+// readHidden reads one line from the console without echoing it.
+func readHidden() string {
+	h := windows.Handle(os.Stdin.Fd())
+	var mode uint32
+	if windows.GetConsoleMode(h, &mode) == nil {
+		windows.SetConsoleMode(h, mode&^windows.ENABLE_ECHO_INPUT)
+		defer windows.SetConsoleMode(h, mode)
+	}
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	return strings.TrimSpace(line)
 }
 
 // stopIfRunning asks a running instance to exit and reports whether one was.
@@ -198,7 +291,7 @@ func doubleClicked() {
 	if install.IsInstalledCopy(exe) {
 		fmt.Println("ooi is already installed. It is a terminal program:")
 		fmt.Println()
-		fmt.Println("  open Windows Terminal or PowerShell and run   ooi serve")
+		fmt.Println("  open Windows Terminal or PowerShell and run   ooi start")
 		fmt.Println()
 		usage(os.Stdout)
 	} else if err := cmdInstall(nil); err != nil {

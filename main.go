@@ -45,7 +45,7 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
-	case "serve":
+	case "serve", "start":
 		err = cmdServe(os.Args[2:])
 	case "code":
 		err = cmdCode(os.Args[2:])
@@ -99,7 +99,7 @@ USAGE
   ooi <command> [flags]
 
 COMMANDS
-  serve     Start the receiver: overlay window + WebRTC, print the join code
+  start     Start in the background and print the link (alias: serve)
   code      Print, show as a link, or rotate this device's join code
   verify    Measure capture protection against every Windows capture API
   demo      Leave a protected window up so you can try recording it yourself
@@ -113,9 +113,10 @@ COMMANDS
 QUICK START
   ooi install                once: put ooi on PATH (open a new terminal after)
   ooi verify                 confirm capture protection works on this PC
-  ooi serve                  start; print the code to send your friend
-  ooi serve --detach         same, but return to the prompt immediately
-  ooi stop                   shut the detached instance down
+  ooi start                  start in the background; prints the link to send
+  ooi start --foreground     same, but stay in this terminal with a live log
+  ooi status                 code, connection and protection state
+  ooi stop                   stop it
 
 Your friend opens the printed link (or the site and types the code), picks a
 window or screen to share, and it appears in your protected overlay.

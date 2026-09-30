@@ -266,27 +266,47 @@ func Uninstall(dataDir string, purgeData bool) error {
 // Release is the latest published release.
 type Release struct {
 	Tag    string
-	ExeURL string
+	ExeURL string // anonymous browser download URL
 	SumURL string
+	ExeAPI string // authenticated API asset URL (works for a private repo)
+	SumAPI string
 }
+
+// ErrPrivate means GitHub hid the release: the repository is private and the
+// request carried no (valid) token.
+var ErrPrivate = errors.New("update: the OOI repository is private; a GitHub token with read access is needed")
+
+// ErrBadToken means GitHub rejected the token.
+var ErrBadToken = errors.New("update: GitHub rejected the token (expired, revoked, or no access to " + Repo + ")")
 
 var httpClient = &http.Client{
 	Timeout:   2 * time.Minute,
 	Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
 }
 
-// Latest asks GitHub for the newest release.
-func Latest(ctx context.Context) (Release, error) {
+// Latest asks GitHub for the newest release. token may be empty for a public
+// repository.
+func Latest(ctx context.Context, token string) (Release, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
 		"https://api.github.com/repos/"+Repo+"/releases/latest", nil)
 	req.Header.Set("accept", "application/vnd.github+json")
 	req.Header.Set("user-agent", "ooi-updater")
+	req.Header.Set("x-github-api-version", "2022-11-28")
+	if token != "" {
+		req.Header.Set("authorization", "Bearer "+token)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Release{}, fmt.Errorf("update: cannot reach GitHub: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusNotFound && token == "":
+		return Release{}, ErrPrivate
+	case resp.StatusCode == http.StatusUnauthorized,
+		resp.StatusCode == http.StatusNotFound && token != "":
+		return Release{}, ErrBadToken
+	case resp.StatusCode != http.StatusOK:
 		return Release{}, fmt.Errorf("update: GitHub returned HTTP %d", resp.StatusCode)
 	}
 	var body struct {
@@ -294,6 +314,7 @@ func Latest(ctx context.Context) (Release, error) {
 		Assets  []struct {
 			Name string `json:"name"`
 			URL  string `json:"browser_download_url"`
+			API  string `json:"url"`
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
@@ -303,9 +324,9 @@ func Latest(ctx context.Context) (Release, error) {
 	for _, a := range body.Assets {
 		switch a.Name {
 		case ExeName:
-			r.ExeURL = a.URL
+			r.ExeURL, r.ExeAPI = a.URL, a.API
 		case "SHA256SUMS.txt":
-			r.SumURL = a.URL
+			r.SumURL, r.SumAPI = a.URL, a.API
 		}
 	}
 	if r.ExeURL == "" {
@@ -316,18 +337,22 @@ func Latest(ctx context.Context) (Release, error) {
 
 // Download fetches the release executable to a temporary file and verifies it
 // against the published SHA-256. It returns the temp path.
-func Download(ctx context.Context, r Release) (string, error) {
-	data, err := fetch(ctx, r.ExeURL, 200<<20)
+func Download(ctx context.Context, r Release, token string) (string, error) {
+	exeURL, sumURL := r.ExeURL, r.SumURL
+	if token != "" {
+		exeURL, sumURL = r.ExeAPI, r.SumAPI
+	}
+	data, err := fetch(ctx, exeURL, token, 200<<20)
 	if err != nil {
 		return "", err
 	}
 	if len(data) < 2 || data[0] != 'M' || data[1] != 'Z' {
 		return "", errors.New("update: download is not a Windows executable")
 	}
-	if r.SumURL == "" {
+	if sumURL == "" {
 		return "", errors.New("update: release has no SHA256SUMS.txt; refusing an unverified binary")
 	}
-	sums, err := fetch(ctx, r.SumURL, 1<<16)
+	sums, err := fetch(ctx, sumURL, token, 1<<16)
 	if err != nil {
 		return "", err
 	}
@@ -352,9 +377,16 @@ func Download(ctx context.Context, r Release) (string, error) {
 	return f.Name(), nil
 }
 
-func fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
+// fetch downloads a URL. With a token it talks to the API asset endpoint, which
+// answers with a redirect to signed storage; Go's client drops the
+// Authorization header on that cross-host redirect, as the storage requires.
+func fetch(ctx context.Context, url, token string, limit int64) ([]byte, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	req.Header.Set("user-agent", "ooi-updater")
+	if token != "" {
+		req.Header.Set("authorization", "Bearer "+token)
+		req.Header.Set("accept", "application/octet-stream")
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("update: download: %w", err)

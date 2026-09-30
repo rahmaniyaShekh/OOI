@@ -24,11 +24,11 @@ jobs:
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -37,8 +37,11 @@ jobs:
       - uses: msys2/setup-msys2@v2
         id: msys2
         with:
+          # MINGW64 (msvcrt) on purpose: the vendored decoder libraries in
+          # third_party/ were built for it, and msvcrt ships with every Windows.
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+          suppress-deprecation-warnings: msystem-mingw64
 
       - name: Build
         shell: pwsh
