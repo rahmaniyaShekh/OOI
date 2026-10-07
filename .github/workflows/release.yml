@@ -63,7 +63,7 @@ jobs:
         run: |
           $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
           $env:CGO_ENABLED = '1'; $env:CC = 'gcc'; $env:CXX = 'g++'
-          go test -short ./internal/code/ ./internal/seal/ ./internal/jitter/ ./internal/gesture/ ./internal/vdec/ ./internal/install/ ./internal/rtc/ ./internal/frame/ ./internal/config/
+          go test -short ./internal/relay/ ./internal/code/ ./internal/seal/ ./internal/jitter/ ./internal/gesture/ ./internal/vdec/ ./internal/install/ ./internal/rtc/ ./internal/frame/ ./internal/config/
 
       - name: Checksums
         shell: pwsh

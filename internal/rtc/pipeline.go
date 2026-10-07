@@ -133,25 +133,8 @@ func (p *pipeline) decodeLoop(frames <-chan jitter.Frame) {
 			p.asm.Resync("decode error: " + err.Error())
 			continue
 		}
-		if !ok {
-			continue
+		if ok {
+			p.s.show(p.dec)
 		}
-		p.s.mu.Lock()
-		p.s.stats.Decoded++
-		w, h := p.dec.Size()
-		p.s.stats.Width, p.s.stats.Height = w, h
-		p.s.stats.LastFrame = time.Now()
-		p.s.mu.Unlock()
-
-		cw, ch := p.s.sink.Size()
-		if cw <= 0 || ch <= 0 {
-			continue
-		}
-		img, _, err := p.dec.Render(cw, ch)
-		if err != nil {
-			continue
-		}
-		p.s.sink.Frame(img)
-		p.s.markDecoded()
 	}
 }

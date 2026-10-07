@@ -12,6 +12,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"ooi/internal/jitter"
+	"ooi/internal/relay"
 	"ooi/internal/vdec"
 )
 
@@ -36,6 +37,12 @@ type Stats struct {
 	Width, Height int
 	LastFrame     time.Time
 	Connected     bool
+	Path          string // "direct" or "relay"
+
+	// Joins that signalled but never formed a media path (driver-wide).
+	FailedJoins   uint64
+	LastFailure   string
+	LastFailureAt time.Time
 }
 
 // session runs exactly one peer connection, from offer to teardown.
@@ -50,6 +57,7 @@ type session struct {
 
 	mu    sync.Mutex
 	stats Stats
+	relay *relay.Conn // set in relay mode
 
 	// decoded is closed once the first frame is on screen: the signal that the
 	// connection is genuinely live, not merely ICE-connected.
@@ -109,6 +117,18 @@ func (s *session) createOffer(ctx context.Context, gatherTimeout time.Duration, 
 		}
 	})
 
+	// Non-trickle, but never wait for gathering to finish by itself: a slow
+	// or dead STUN server would hold the offer for its full timeout. Once the
+	// first public (server-reflexive or relay) candidate is in, give the rest
+	// one second; overall the wait is capped by gatherTimeout.
+	public := make(chan struct{})
+	var publicOnce sync.Once
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c != nil && (c.Typ == webrtc.ICECandidateTypeSrflx || c.Typ == webrtc.ICECandidateTypeRelay) {
+			publicOnce.Do(func() { close(public) })
+		}
+	})
+
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		pc.Close()
@@ -119,15 +139,29 @@ func (s *session) createOffer(ctx context.Context, gatherTimeout time.Duration, 
 		pc.Close()
 		return "", err
 	}
-	select {
-	case <-gather:
-	case <-time.After(gatherTimeout):
-		// Non-trickle: send whatever candidates we have rather than stalling.
-		s.log.Printf("ICE gathering timed out after %s; sending partial candidates", gatherTimeout)
-	case <-ctx.Done():
-		pc.Close()
-		return "", ctx.Err()
+	start := time.Now()
+	deadline := time.NewTimer(gatherTimeout)
+	defer deadline.Stop()
+	var grace <-chan time.Time
+	for done := false; !done; {
+		select {
+		case <-gather:
+			done = true
+		case <-public:
+			public = nil
+			grace = time.After(time.Second)
+		case <-grace:
+			done = true
+		case <-deadline.C:
+			// Send whatever candidates we have rather than stalling.
+			s.log.Printf("ICE gathering timed out after %s; sending partial candidates", gatherTimeout)
+			done = true
+		case <-ctx.Done():
+			pc.Close()
+			return "", ctx.Err()
+		}
 	}
+	s.log.Printf("offer ready after %s", time.Since(start).Round(time.Millisecond))
 	return pc.LocalDescription().SDP, nil
 }
 
@@ -146,6 +180,7 @@ func (s *session) onTrack(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 	}
 	s.mu.Lock()
 	s.stats.Codec = codec.String()
+	s.stats.Path = "direct"
 	s.mu.Unlock()
 	s.log.Printf("receiving %s (payload %d)", codec, track.PayloadType())
 
@@ -207,11 +242,46 @@ func (s *session) updateRTT() time.Duration {
 	return 0
 }
 
-// Close tears the peer connection down.
+// closePeer drops the WebRTC peer connection (the page moved to the relay).
+func (s *session) closePeer() {
+	if s.pc != nil {
+		s.pc.OnConnectionStateChange(func(webrtc.PeerConnectionState) {})
+		s.pc.Close()
+	}
+}
+
+// Close tears the peer connection or relay down.
 func (s *session) Close() {
 	if s.pc != nil {
 		s.pc.Close()
 	}
+	s.mu.Lock()
+	r := s.relay
+	s.mu.Unlock()
+	if r != nil {
+		r.Close() // outside the lock: the reader may need it to finish
+	}
+}
+
+// show renders the decoder's current picture onto the sink.
+func (s *session) show(dec *vdec.Decoder) {
+	s.mu.Lock()
+	s.stats.Decoded++
+	w, h := dec.Size()
+	s.stats.Width, s.stats.Height = w, h
+	s.stats.LastFrame = time.Now()
+	s.mu.Unlock()
+
+	cw, ch := s.sink.Size()
+	if cw <= 0 || ch <= 0 {
+		return
+	}
+	img, _, err := dec.Render(cw, ch)
+	if err != nil {
+		return
+	}
+	s.sink.Frame(img)
+	s.markDecoded()
 }
 
 var errClosed = errors.New("rtc: session closed")

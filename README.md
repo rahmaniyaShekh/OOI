@@ -94,6 +94,49 @@ between the two machines**, encrypted end to end.
   connection data and then leaves the path. The full pattern is in
   [P2P_SHORT_CODE_CONNECT.md](P2P_SHORT_CODE_CONNECT.md).
 
+### When the two networks cannot reach each other: the relay
+
+Some network pairs can never form a direct path, whatever STUN says. Example:
+the friend is behind a carrier-grade NAT (mobile or some fibre ISPs) that picks
+a new public port per destination, and you are behind a router that drops
+packets from unexpected ports. The browser's connectivity checks then go out
+and nothing ever answers. Before v1.1.0 the page sat on "Connecting…" forever.
+
+Now:
+
+1. The page watches its ICE stats. Seven seconds after its answer, if it has
+   sent more than 10 checks and none were answered, it gives up on direct.
+2. It asks the host for the **relay** on the same offer, putting a fresh
+   AES-256-GCM key inside its code-sealed answer. Hosts advertise the relay
+   with `caps:["relay"]`, and the page only asks when the host has it.
+3. Both sides open a WebSocket to the room's Durable Object, which forwards
+   every message to the other side. Each message is
+   `iv | AES-GCM(type | payload) | tag` under that key, so the Worker forwards
+   ciphertext it cannot read.
+4. The page encodes the screen itself with WebCodecs (VP9 preferred, up to
+   1080p) and sends one message per frame, capped at 15 fps. The path is TCP,
+   so nothing is lost. The bitrate steps down ~25% when the page's socket
+   backs up or the host's decode queue grows, and creeps back up after 10
+   clean seconds. The host asks for a keyframe whenever it has to drop frames.
+5. The tab remembers it (`sessionStorage`, `ooi.relay.<code>`), so a reconnect
+   goes straight to the relay. Two failed relay attempts go back to trying
+   direct.
+
+`ooi status` shows `path  relayed through the rendezvous` while it is in use,
+and failed joins are listed with their reason. The relay needs desktop
+Chrome or Edge (Firefox works but throttles a background tab). A page talking
+to a host older than v1.1.0 tells the friend to ask you to `ooi update`.
+
+**Free-plan budget.** Direct sessions never touch the relay. A relayed session
+counts against the Cloudflare free plan: Workers + Durable Objects allow
+100,000 requests a day, and incoming WebSocket messages count 20:1. At 8 fps
+(the default) that is about 1,440 requests an hour; at 15 fps, about 2,700.
+Durable Object duration (13,000 GB-s a day) is the tighter limit: a busy object
+uses about 450 GB-s an hour, so **about 28 hours of relayed streaming per
+day**, shared by everyone using this deployment. The host's normal 2-second
+answer polling also counts as requests (about 1,800 an hour while waiting).
+`ooi start --no-relay` turns the relay off.
+
 ---
 
 ## Video quality on a slow connection
@@ -230,6 +273,7 @@ ooi start   (alias: serve)
   --turn turn:host:port    TURN relay for when a direct path is impossible
   --turn-user / --turn-pass  TURN credentials
   --no-stun                LAN-only, no external STUN contact
+  --no-relay               do not offer the encrypted relay when a direct path fails
   --new-code               rotate the join code before starting
   --click-through          let mouse clicks pass through (default true)
   --no-hotkeys             do not register global hotkeys

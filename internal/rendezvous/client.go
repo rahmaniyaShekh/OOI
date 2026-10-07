@@ -45,8 +45,12 @@ func New(base string) *Client {
 				// runs WPAD auto-discovery, which on Windows can stall the first
 				// request for ~8 s on networks that have no WPAD server.
 				Proxy: http.ProxyFromEnvironment,
+				// Some networks intermittently drop SYNs to one of the service's
+				// two addresses, and a plain connect then waits out Windows' 21 s
+				// SYN retry. Go splits the dial timeout across the addresses, so
+				// 7 s caps each one at 3.5 s before moving to the next.
 				DialContext: (&net.Dialer{
-					Timeout:   8 * time.Second,
+					Timeout:   7 * time.Second,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
 				TLSHandshakeTimeout:   8 * time.Second,
@@ -88,12 +92,32 @@ func (c *Client) do(ctx context.Context, method, path string, body any) (*http.R
 	return c.http.Do(req)
 }
 
+// PublishParams is one offer to publish.
+type PublishParams struct {
+	ID, Session, Offer string
+	// Owner is a secret only this host knows; the relay admits it as the host.
+	Owner string
+	// Caps advertises what this host can do beyond direct WebRTC ("relay").
+	Caps []string
+}
+
+// RelayURL is the host's relay WebSocket for a session.
+func (c *Client) RelayURL(id, session, owner string) string {
+	return c.base + "/api/room/" + id + "/relay?session=" + session + "&role=host&owner=" + owner
+}
+
 // Publish creates or overwrites the room with a fresh offer. Publishing is the one
 // call the whole flow depends on, so it retries with backoff before failing.
-func (c *Client) Publish(ctx context.Context, id, session, offer string) error {
-	payload := map[string]string{"id": id, "session": session, "offer": offer}
+func (c *Client) Publish(ctx context.Context, p PublishParams) error {
+	payload := map[string]any{"id": p.ID, "session": p.Session, "offer": p.Offer}
+	if p.Owner != "" {
+		payload["owner"] = p.Owner
+	}
+	if len(p.Caps) > 0 {
+		payload["caps"] = p.Caps
+	}
 	var last error
-	for attempt, wait := 0, time.Second; attempt < 3; attempt, wait = attempt+1, wait*2 {
+	for attempt, wait := 0, 500*time.Millisecond; attempt < 4; attempt, wait = attempt+1, wait*2 {
 		resp, err := c.do(ctx, http.MethodPost, "/api/room", payload)
 		if err == nil {
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))

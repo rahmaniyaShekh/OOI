@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -45,11 +46,14 @@ Safe to run again: it replaces the installed copy with this one.
 		return err
 	}
 	// Replacing a running instance's exe is fine (it is renamed aside), but the
-	// running one would keep the old code; stop it so the new one is used.
-	wasRunning := stopIfRunning()
+	// running one would keep the old code; stop it, and start the new one.
+	was, wasRunning := stopIfRunning()
 
 	res, err := install.Install(exe)
 	if err != nil {
+		if wasRunning {
+			restart(exe, was) // never leave nothing running
+		}
 		return err
 	}
 	// A token can come from the flag, or from OOI_GITHUB_TOKEN (how install.ps1
@@ -103,8 +107,7 @@ Safe to run again: it replaces the installed copy with this one.
 	fmt.Println("    ooi update          get the latest release")
 	fmt.Println()
 	if wasRunning {
-		fmt.Println("  (a running instance was stopped; start it again with `ooi start`)")
-		fmt.Println()
+		restart(res.Target, was)
 	}
 	return nil
 }
@@ -218,16 +221,32 @@ FLAGS
 	}
 	defer os.Remove(tmp)
 
-	wasRunning := stopIfRunning()
+	was, wasRunning := stopIfRunning()
 	res, err := install.Install(tmp)
 	if err != nil {
+		if wasRunning {
+			if self, e := os.Executable(); e == nil {
+				restart(self, was) // never leave nothing running
+			}
+		}
 		return err
 	}
 	fmt.Printf("  updated to %s at %s\n", rel.Tag, res.Target)
 	if wasRunning {
-		fmt.Println("  the running instance was stopped; start it again with `ooi start`")
+		restart(res.Target, was)
 	}
 	return nil
+}
+
+// restart starts exe in the background with the flags the stopped instance
+// had, and reports the result.
+func restart(exe string, was procctl.State) {
+	fmt.Println("  restarting the receiver ...")
+	cmd := exec.Command(exe, append([]string{"start"}, was.Args...)...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Println("  could not restart it (" + err.Error() + "); run `ooi start`")
+	}
 }
 
 // isTerminal reports whether stdin is an interactive console.
@@ -248,24 +267,25 @@ func readHidden() string {
 	return strings.TrimSpace(line)
 }
 
-// stopIfRunning asks a running instance to exit and reports whether one was.
-func stopIfRunning() bool {
+// stopIfRunning asks a running instance to exit and reports whether one was,
+// with its recorded state.
+func stopIfRunning() (procctl.State, bool) {
 	dir, err := procctl.Dir()
 	if err != nil {
-		return false
+		return procctl.State{}, false
 	}
 	st, err := procctl.Load(dir)
 	if err != nil {
-		return false
+		return procctl.State{}, false
 	}
 	if cl, err := controlClientFor(st.Local); err == nil && cl.Stop() == nil && waitGone(st.PID, 5*time.Second) {
 		procctl.Clear(dir)
-		return true
+		return st, true
 	}
 	procctl.Kill(st.PID)
 	waitGone(st.PID, 3*time.Second)
 	procctl.Clear(dir)
-	return true
+	return st, true
 }
 
 func mustDir() string {

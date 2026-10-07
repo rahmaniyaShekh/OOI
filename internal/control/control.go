@@ -38,6 +38,11 @@ type Status struct {
 	AffinityRestored uint64 `json:"affinity_restored"`
 	FailClosed       uint64 `json:"fail_closed"`
 	LastFrameAgoMS   int64  `json:"last_frame_ago_ms"`
+
+	Path            string `json:"path,omitempty"` // "direct" or "relay"
+	FailedJoins     uint64 `json:"failed_joins,omitempty"`
+	LastFailure     string `json:"last_failure,omitempty"`
+	LastFailureAgoS int64  `json:"last_failure_ago_s,omitempty"`
 }
 
 // Server is the loopback control listener.

@@ -93,6 +93,51 @@ const run = async () => {
   ok(r.status===200 && csp.includes("frame-ancestors 'none'"),'joiner page served with CSP header');
   ok((r.headers.get('permissions-policy')||'').includes('display-capture'),'permissions-policy allows display-capture');
 
+  // 9. health
+  r=await fetch(base+'/api/health'); const h=await r.json();
+  ok(r.status===200 && h.ok===true && h.service==='ooi','health reports ooi');
+
+  // 10. relay: caps round trip, owner check, pairing, forwarding, peer close
+  const owner=crypto.randomBytes(16).toString('hex'), rs=session();
+  await fetch(base+'/api/room',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({id,session:rs,offer,owner,caps:['relay','bogus']})});
+  r=await fetch(base+`/api/room/${id}`,{cache:'no-store'}); const withCaps=await r.json();
+  ok(JSON.stringify(withCaps.caps)==='["relay"]','caps round trip (whitelisted)');
+  const wsBase=base.replace(/^http/,'ws')+`/api/room/${id}/relay?session=${rs}`;
+  const open=url=>new Promise(res=>{
+    const ws=new WebSocket(url); ws.binaryType='arraybuffer';
+    const q=[], waiters=[];
+    ws.onmessage=e=>{ const w=waiters.shift(); w?w(e.data):q.push(e.data); };
+    ws.next=(ms=5000)=>q.length?Promise.resolve(q.shift()):new Promise(r=>{ waiters.push(r); setTimeout(()=>r(null),ms); });
+    ws.closed=new Promise(r=>ws.addEventListener('close',e=>r(e.code)));
+    ws.onopen=()=>res(ws); ws.onerror=()=>res(null);
+  });
+  const bad=await open(wsBase+'&role=host');
+  ok(!bad,'host role rejected without the owner');
+  const bad2=await open(wsBase+'&role=host&owner='+'0'.repeat(32));
+  ok(!bad2,'host role rejected with the wrong owner');
+  const host=await open(wsBase+'&role=host&owner='+owner);
+  const viewer=await open(wsBase+'&role=viewer');
+  ok(host && viewer,'host and viewer pair on the session');
+  viewer.send(new Uint8Array([3,1,2,3]));
+  let fwd=await host.next();
+  ok(fwd && Buffer.from(fwd).equals(Buffer.from([3,1,2,3])),'viewer -> host forwarded verbatim');
+  host.send(new Uint8Array([2,9,9]));
+  fwd=await viewer.next();
+  ok(fwd && Buffer.from(fwd).equals(Buffer.from([2,9,9])),'host -> viewer forwarded verbatim');
+  const big=new Uint8Array(700*1024).fill(7);
+  viewer.send(big);
+  fwd=await host.next(10000);
+  ok(fwd && fwd.byteLength===big.length,'a 700 KiB keyframe message passes');
+  host.send("ping"); fwd=await host.next();
+  ok(fwd==='pong','keepalive ping answered');
+  const staleWs=await open(base.replace(/^http/,'ws')+`/api/room/${id}/relay?session=${session()}&role=viewer`);
+  ok(!staleWs,"viewer on a stale session rejected");
+  viewer.close();
+  const closeCode=await Promise.race([host.closed, new Promise(r=>setTimeout(()=>r('timeout'),5000))]);
+  ok(closeCode!=="timeout","viewer close propagates to the host");
+  await fetch(base+`/api/room/${id}`,{method:'DELETE'});
+
   console.log(failures?`\n${failures} FAILURE(S)`:'\nALL PASSED');
   process.exit(failures?1:0);
 };

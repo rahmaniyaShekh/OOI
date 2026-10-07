@@ -1,6 +1,8 @@
 package rtc
 
 import (
+	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -156,12 +158,34 @@ func newAPI(order []vdec.Codec) (*webrtc.API, error) {
 		return true
 	})
 
+	// Test hook: OOI_TEST_BLOCK_DIRECT=1 (with --no-stun) puts every ICE
+	// candidate on a socket that silently drops traffic both ways. That is
+	// exactly what two incompatible NATs look like from the page: its checks
+	// go out and nothing ever answers, so it must fall back to the relay.
+	if os.Getenv("OOI_TEST_BLOCK_DIRECT") == "1" {
+		if conn, err := net.ListenUDP("udp4", &net.UDPAddr{}); err == nil {
+			se.SetICEUDPMux(webrtc.NewICEUDPMux(nil, blackhole{conn}))
+		}
+	}
+
 	return webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(reg),
 		webrtc.WithSettingEngine(se),
 	), nil
 }
+
+// blackhole is a UDP socket that never delivers or sends anything.
+type blackhole struct{ *net.UDPConn }
+
+func (b blackhole) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		if _, _, err := b.UDPConn.ReadFrom(p); err != nil {
+			return 0, nil, err
+		}
+	}
+}
+func (b blackhole) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
 
 func itoa(n int) string {
 	if n == 0 {

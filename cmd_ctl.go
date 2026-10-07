@@ -105,6 +105,11 @@ func cmdStatus(args []string) error {
 	fmt.Printf("  overlay      %s\n", shown)
 	fmt.Printf("  state        %s\n", state)
 	if s.Connected {
+		path := "direct (peer to peer)"
+		if s.Path == "relay" {
+			path = "relayed through the rendezvous (end-to-end encrypted; no direct path between the networks)"
+		}
+		fmt.Println("  path         " + path)
 		fmt.Printf("  video        %s %dx%d", s.Codec, s.Width, s.Height)
 		if s.RTTMillis > 0 {
 			fmt.Printf(", rtt %dms", s.RTTMillis)
@@ -116,6 +121,9 @@ func cmdStatus(args []string) error {
 		if s.LastFrameAgoMS >= 0 {
 			fmt.Printf("  last frame   %dms ago\n", s.LastFrameAgoMS)
 		}
+	}
+	if s.FailedJoins > 0 {
+		fmt.Printf("  failed joins %d (last %ds ago: %s)\n", s.FailedJoins, s.LastFailureAgoS, s.LastFailure)
 	}
 	if !s.Protected {
 		return fmt.Errorf("capture protection is not active")

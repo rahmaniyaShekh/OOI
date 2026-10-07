@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func TestEndToEndOverRealRendezvous(t *testing.T) {
 		t.Fatal(err)
 	}
 	roomID := code.RoomID(joinCode)
-	service := rendezvous.DefaultService
+	service := e2eService()
 
 	// Pre-encode a couple of seconds of real VP9 to replay on a loop.
 	const vw, vh = 640, 360
@@ -307,6 +308,12 @@ func runJoinerAttempt(t *testing.T, ctx context.Context, rz *rendezvous.Client, 
 		return
 	}
 	if err := rz.PostAnswer(ctx, roomID, sessionID, sealed); err != nil {
+		if errors.Is(err, rendezvous.ErrStale) {
+			// The host re-offered while we answered: take the new offer, as
+			// the page does.
+			t.Logf("joiner: offer replaced while answering; retrying")
+			return
+		}
 		t.Errorf("joiner post answer: %v", err)
 		return
 	}

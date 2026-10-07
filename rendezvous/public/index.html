@@ -154,6 +154,10 @@ function rememberHost(code,name){
   putSaved(list);
   renderSaved();
 }
+// Per-tab memory (the relay flag): storage can be unavailable, never fatal.
+const ssGet=k=>{try{return sessionStorage.getItem(k)}catch{return null}};
+const ssSet=(k,v)=>{try{sessionStorage.setItem(k,v)}catch{}};
+const ssDel=k=>{try{sessionStorage.removeItem(k)}catch{}};
 function forgetHost(code){ putSaved(loadSaved().filter(e=>e.code!==code)); renderSaved(); }
 
 // ---- DOM ------------------------------------------------------------------
@@ -213,18 +217,23 @@ const ATTEMPT_TIMEOUT=25000, GATHER_TIMEOUT=8000, SESSION_COOLDOWN=30000;
 const sleep = ms=>new Promise(r=>setTimeout(r,ms));
 let generation=0, wakeLock=null, shareStream=null;
 
+let picking=false;
 async function start(code){
   code = normalizeCode(code);
-  if(code.length!==6) return;
+  if(code.length!==6 || picking) return;
   // Capture the screen up front, once, so a reconnect reuses the same stream
-  // and the user is not re-prompted on every host restart.
+  // and the user is not re-prompted on every host restart. One picker at a
+  // time: a deep link starts by itself, and a click while its picker is open
+  // must not start a second, competing connection.
   if(!shareStream){
+    picking=true;
     try{
       shareStream = await navigator.mediaDevices.getDisplayMedia({
         video:{ frameRate:{ ideal:Number(elFps.value), max:Number(elFps.value) } },
         audio:false
       });
     }catch(e){ showJoin('Screen share was cancelled.',true); return; }
+    finally{ picking=false; }
     // If the user stops sharing from the browser's own control, end cleanly.
     shareStream.getVideoTracks()[0].addEventListener('ended',()=>{ stop(); showJoin('Screen sharing ended.'); });
   }
@@ -249,7 +258,10 @@ async function driver(code, gen){
   const id=await roomIdFor(code);
   const known=Boolean(findSaved(code));
   const spent=new Map();
-  let everConnected=false, waitingSince=Date.now();
+  let everConnected=false, waitingSince=Date.now(), failedInARow=0;
+  // Once this tab has needed the relay for this host, go straight to it.
+  const stickyKey='ooi.relay.'+code;
+  let useRelay=ssGet(stickyKey)==='1', relayFails=0;
 
   while(gen===generation){
     let room;
@@ -268,11 +280,28 @@ async function driver(code, gen){
     const lost=spent.get(room.session);
     if(lost && Date.now()-lost<SESSION_COOLDOWN){ await sleep(1000); continue; }
 
-    const outcome=await attempt(id, code, room, gen, ()=>{
+    const hostRelays=(room.caps||[]).includes('relay');
+    const canRelay=hostRelays && relaySupported();
+    const viaRelay=useRelay && canRelay;
+    const outcome=await (viaRelay?relayAttempt:attempt)(id, code, room, gen, ()=>{
       everConnected=true; rememberHost(code);
     });
     if(gen!==generation) return;
     if(outcome==='badcode'){ stop(); showJoin('That code is not right.',true); return; }
+    const failed=outcome==='failed'||outcome==='timeout';
+    failedInARow=failed?failedInARow+1:0;
+    if(failed && !viaRelay && canRelay){
+      // The two networks cannot reach each other directly: carry the stream
+      // through the server instead, still end-to-end encrypted. The host is
+      // still listening on this offer, so retry it at once.
+      useRelay=true; relayFails=0;
+      continue;
+    }
+    if(failed && viaRelay && ++relayFails>=2){ useRelay=false; relayFails=0; ssDel(stickyKey); }
+    if(failedInARow>=2 && !hostRelays)
+      watchStatus('Still trying…',"Your network can't reach your friend's computer directly. Ask them to update OOI (run: ooi update) so the stream can be relayed.",'err');
+    else if(failedInARow>=2 && !relaySupported())
+      watchStatus('Still trying…',"Your network can't reach your friend's computer directly, and this browser cannot use the relay. Use desktop Chrome or Edge.",'err');
     if(outcome!=='stale'){ spent.set(room.session,Date.now()); await sleep(500); }
     waitingSince=Date.now();
   }
@@ -310,7 +339,22 @@ async function attempt(id, code, room, gen, onLive){
     if(!post.ok){ pc.close(); return 'failed'; }
 
     const timer=setTimeout(()=>done.resolve('timeout'), ATTEMPT_TIMEOUT);
-    const watch=setInterval(()=>{ if(pc.connectionState==='connected') done.resolve('connected'); },250);
+    const posted=Date.now(), canRelay=(room.caps||[]).includes('relay') && relaySupported();
+    const watch=setInterval(async()=>{
+      if(pc.connectionState==='connected') return done.resolve('connected');
+      // Seven seconds of connectivity checks without a single reply means the
+      // two networks cannot reach each other: stop waiting, use the relay.
+      if(canRelay && Date.now()-posted>7000){
+        try{
+          let sent=0, answered=0;
+          (await pc.getStats()).forEach(r=>{ if(r.type==='candidate-pair'){ sent+=r.requestsSent||0; answered+=r.responsesReceived||0; } });
+          if(pc.iceConnectionState!=='connected' && answered===0 && (sent>10 || Date.now()-posted>12000)){
+            timing.directGaveUp=Date.now()-posted;
+            done.resolve('failed');
+          }
+        }catch{}
+      }
+    },250);
     const supersede=setInterval(async()=>{
       try{ const now=await getOffer(id); if(!now||now.session!==room.session) done.resolve('stale'); }catch{}
     },2000);
@@ -368,7 +412,7 @@ function startStats(pc){
           if(lastTs) kbps=Math.round((bytes-lastBytes)*8/(now-lastTs));
           lastBytes=bytes; lastTs=now;
           const w=s.frameWidth||0, h=s.frameHeight||0, fps=Math.round(s.framesPerSecond||0);
-          line=`${w}×${h}  ${fps} fps  ${kbps} kbps\ncodec ${(s.codecId?'':'')}sent ${(bytes/1048576).toFixed(1)} MiB`;
+          line=`${w}×${h}  ${fps} fps  ${kbps} kbps  direct\ncodec ${(s.codecId?'':'')}sent ${(bytes/1048576).toFixed(1)} MiB`;
         }
       });
       rep.forEach(s=>{ if(s.type==='candidate-pair'&&s.nominated&&s.currentRoundTripTime!=null) line+=`  rtt ${Math.round(s.currentRoundTripTime*1000)} ms`; });
@@ -377,6 +421,250 @@ function startStats(pc){
   },1000);
 }
 function stopStats(){ if(statsTimer){ clearInterval(statsTimer); statsTimer=null; } }
+
+// ---- relay: the stream through the server when no direct path exists -----
+// Some network pairs can never form a direct path (a carrier-grade NAT that
+// picks a new port per destination facing a router that drops unexpected
+// ports). Then this page encodes the screen itself with WebCodecs and sends
+// each frame over a WebSocket that the rendezvous pairs with the host's. A
+// fresh AES-256-GCM key travels inside the code-sealed answer, so the server
+// forwards ciphertext it cannot read. Every message is
+//   iv(12) | AES-GCM(type(1) | payload) | tag(16)
+// with types 2 = control JSON and 3 = video, and the direction bound in as
+// additional data. The path is TCP, so nothing is lost; only the rate matters:
+// the bitrate follows this socket's send backlog and the host's decode backlog.
+// Free-plan budget: about one message per frame, so the relay is capped at
+// 15 fps (see README).
+const relaySupported=()=>'VideoEncoder' in window && 'VideoFrame' in window && 'WebSocket' in window;
+const AD_V2H=new TextEncoder().encode('OOI-relay/v1 v2h'), AD_H2V=new TextEncoder().encode('OOI-relay/v1 h2v');
+const RELAY_FPS_MAX=15, FRAG=240*1024, RATE_MIN=150_000, RATE_MAX=4_000_000, RATE_START=1_200_000;
+const timing={};             // measured fallback timings, for diagnostics
+window.ooiTiming=timing;
+
+function encoderConfig(name,w,h,bitrate,fps){
+  const base={width:w,height:h,bitrate,framerate:fps,latencyMode:'realtime',bitrateMode:'variable'};
+  if(name==='vp9') return {...base,codec:'vp09.00.41.08'};
+  if(name==='vp8') return {...base,codec:'vp8'};
+  if(name==='h264') return {...base,codec:'avc1.42E032',avc:{format:'annexb'}};
+  if(name==='av1') return {...base,codec:'av01.0.08M.08'};
+  return null;
+}
+// Keyframes of a 4K screen are huge and slow on a relayed path: cap at 1080p.
+function fitSize(w,h){
+  const s=Math.min(1,1920/w,1080/h);
+  return {w:Math.max(2,Math.round(w*s/2)*2), h:Math.max(2,Math.round(h*s/2)*2)};
+}
+
+async function relayAttempt(id, code, room, gen, onLive){
+  const t0=Date.now();
+  watchStatus('Connecting through the relay…',"Your network can't reach your friend's computer directly, so the stream goes through the server, still end-to-end encrypted.",'wait');
+  const raw=crypto.getRandomValues(new Uint8Array(32));
+  let answer;
+  try{ answer=await sealBlob(JSON.stringify({relay:1,key:b64u(raw)}),code); }catch{ return 'failed'; }
+  let post;
+  try{ post=await fetch(api(`/api/room/${id}/answer`),{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({answer,session:room.session})}); }catch{ return 'failed'; }
+  if(post.status===409) return 'stale';
+  if(!post.ok) return 'failed';
+  if(gen!==generation) return 'aborted';
+  const key=await crypto.subtle.importKey('raw',raw,'AES-GCM',false,['encrypt','decrypt']);
+
+  let done=deferred();
+  const ws=new WebSocket(`${location.origin.replace(/^http/,'ws')}${MOUNT}/api/room/${id}/relay?session=${room.session}&role=viewer`);
+  ws.binaryType='arraybuffer';
+  const R={ws,closed:false,live:false,hello:null,enc:null,cfg:null,codec:'',fps:8,w:0,h:0,
+    bitrate:RATE_START,cleanSince:Date.now(),lastChange:0,wantKey:true,pending:0,skipped:0,
+    sent:0,frames:0,lastFrame:null,lastEncodeAt:0,rx:null,rtt:0,timers:[],reader:null,clone:null,canvas:null,ctx:null};
+  window.ooiRelay=R;
+  let sendChain=Promise.resolve(), recvChain=Promise.resolve();
+
+  // Sealing is async; chain it so messages leave in order.
+  const send=(type,payload)=>{
+    if(ws.readyState!==1) return;
+    R.pending+=payload.length;
+    sendChain=sendChain.then(async()=>{
+      const plain=new Uint8Array(payload.length+1); plain[0]=type; plain.set(payload,1);
+      const iv=crypto.getRandomValues(new Uint8Array(12));
+      const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:AD_V2H},key,plain));
+      R.pending-=payload.length;
+      if(ws.readyState===1){ ws.send(cat(iv,ct)); R.sent+=ct.length+12; }
+    }).catch(()=>{});
+  };
+  const ctl=o=>send(2,new TextEncoder().encode(JSON.stringify(o)));
+
+  const onChunk=chunk=>{
+    const data=new Uint8Array(chunk.byteLength); chunk.copyTo(data);
+    const key=chunk.type==='key', ts=Math.floor(chunk.timestamp/1000)>>>0;
+    for(let off=0;;off+=FRAG){
+      const part=data.subarray(off,Math.min(off+FRAG,data.length)), more=off+FRAG<data.length;
+      const m=new Uint8Array(9+part.length), dv=new DataView(m.buffer);
+      m[0]=(key?1:0)|(more?2:0); dv.setUint32(1,ts); dv.setUint32(5,part.length); m.set(part,9);
+      send(3,m);
+      if(!more) break;
+    }
+    R.frames++;
+  };
+
+  const configure=()=>{ try{ R.enc.configure(R.cfg); }catch(e){ done.resolve(R.live?'dropped':'failed'); } };
+  const setBitrate=b=>{
+    R.bitrate=Math.round(Math.max(RATE_MIN,Math.min(RATE_MAX,b)));
+    R.lastChange=Date.now(); R.cfg={...R.cfg,bitrate:R.bitrate}; configure();
+  };
+  // Step down ~25% quickly when either end falls behind; creep up after ten
+  // clean seconds.
+  const adapt=()=>{
+    if(!R.cfg) return;
+    const now=Date.now(), m=R.rx||{};
+    const backlog=ws.bufferedAmount+R.pending;
+    const congested=backlog>R.bitrate/8*0.25 || (m.q||0)>2 || (m.drop||0)>0 || R.skipped>R.fps/3;
+    R.skipped=0;
+    if(congested){
+      R.cleanSince=now;
+      if(now-R.lastChange>1500 && R.bitrate>RATE_MIN) setBitrate(R.bitrate*0.75);
+    }else if(now-R.cleanSince>10000 && now-R.lastChange>10000 && R.bitrate<RATE_MAX){
+      setBitrate(R.bitrate*1.15); R.cleanSince=now;
+    }
+  };
+
+  const encode=f=>{
+    if(R.closed || !R.enc || R.enc.state!=='configured') return;
+    // Back-pressure: skip a frame while the socket or the encoder is behind,
+    // and make the next one a keyframe only if the host asks.
+    if(ws.bufferedAmount+R.pending>Math.max(128*1024,R.bitrate/8*0.5) || R.enc.encodeQueueSize>2){ R.skipped++; return; }
+    const src=fitSize(f.displayWidth,f.displayHeight);
+    if(src.w!==R.w || src.h!==R.h){            // the shared window was resized
+      R.w=src.w; R.h=src.h; R.cfg={...R.cfg,width:R.w,height:R.h}; configure(); R.wantKey=true;
+    }
+    const ts=Math.round(performance.now()*1000);
+    let vf;
+    if(f.displayWidth===R.w && f.displayHeight===R.h) vf=new VideoFrame(f,{timestamp:ts});
+    else{
+      if(!R.canvas || R.canvas.width!==R.w || R.canvas.height!==R.h){ R.canvas=new OffscreenCanvas(R.w,R.h); R.ctx=R.canvas.getContext('2d'); }
+      R.ctx.drawImage(f,0,0,R.w,R.h); vf=new VideoFrame(R.canvas,{timestamp:ts});
+    }
+    R.lastEncodeAt=performance.now();
+    try{ R.enc.encode(vf,{keyFrame:R.wantKey}); R.wantKey=false; }catch{}
+    vf.close();
+  };
+  // Keep the newest frame: a static screen produces none, and a keyframe the
+  // host asks for must still be sent.
+  const take=f=>{
+    if(R.closed){ f.close(); return; }
+    if(R.lastFrame) R.lastFrame.close();
+    R.lastFrame=f;
+    if(performance.now()-R.lastEncodeAt>=1000/R.fps-4) encode(f);
+  };
+
+  const startEncoder=async h=>{
+    showPreview();
+    const track=shareStream.getVideoTracks()[0], st=track.getSettings();
+    R.fps=Math.min(Number(elFps.value)||8, h.maxFps||RELAY_FPS_MAX, RELAY_FPS_MAX);
+    ({w:R.w,h:R.h}=fitSize(st.width||1920, st.height||1080));
+    // The host's preference order, with AV1 last: it costs this side far more CPU.
+    const names=(h.codecs||['vp9','vp8','h264']).filter(n=>n!=='av1').concat((h.codecs||[]).includes('av1')?['av1']:[]);
+    for(const n of names){
+      const cfg=encoderConfig(n,R.w,R.h,R.bitrate,R.fps);
+      if(!cfg) continue;
+      try{ if((await VideoEncoder.isConfigSupported(cfg)).supported){ R.codec=n; R.cfg=cfg; break; } }catch{}
+    }
+    if(!R.cfg) throw new Error('This browser cannot encode any video format your friend\'s OOI can show.');
+    R.enc=new VideoEncoder({output:onChunk,error:()=>done.resolve(R.live?'dropped':'failed')});
+    configure();
+    ctl({t:'config',codec:R.codec});
+    if('MediaStreamTrackProcessor' in window){
+      // Frames straight from the capture, unthrottled even in a background tab.
+      R.clone=track.clone();
+      R.reader=new MediaStreamTrackProcessor({track:R.clone}).readable.getReader();
+      (async()=>{
+        for(;;){
+          let r; try{ r=await R.reader.read(); }catch{ break; }
+          if(r.done) break;
+          take(r.value);
+        }
+      })();
+    }else{
+      R.timers.push(setInterval(()=>{
+        if(elPreview.readyState>=2) try{ take(new VideoFrame(elPreview,{timestamp:Math.round(performance.now()*1000)})); }catch{}
+      },1000/R.fps));
+    }
+    R.timers.push(setInterval(()=>{
+      if(R.wantKey && R.lastFrame && performance.now()-R.lastEncodeAt>300) encode(R.lastFrame);
+    },150));
+  };
+
+  const handle=async data=>{
+    const buf=new Uint8Array(data);
+    if(buf.length<29) return;
+    let plain;
+    try{ plain=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:buf.subarray(0,12),additionalData:AD_H2V},key,buf.subarray(12))); }
+    catch{ return; }
+    if(R.closed || plain[0]!==2) return;
+    let m; try{ m=JSON.parse(new TextDecoder().decode(plain.subarray(1))); }catch{ return; }
+    if(m.t==='hello' && !R.hello){
+      R.hello=m; timing.relayHello=Date.now()-t0;
+      watchStatus('Connecting through the relay…','Starting the video…','wait');
+      startEncoder(m).catch(e=>{ watchStatus('Cannot relay',e.message,'err'); done.resolve('failed'); });
+    }else if(m.t==='keyframe'){ R.wantKey=true; }
+    else if(m.t==='rx'){
+      R.rx=m;
+      if(m.ping) ctl({t:'pong',id:m.ping});
+      if(m.dec>0 && !R.live){ timing.relayFirstFrame=Date.now()-t0; done.resolve('connected'); }
+      adapt();
+    }else if(m.t==='pong'){ R.rtt=Date.now()-m.id; }
+    else if(m.t==='ping'){ ctl({t:'pong',id:m.id}); }
+  };
+  ws.onmessage=ev=>{ if(typeof ev.data!=='string') recvChain=recvChain.then(()=>handle(ev.data)); };
+  ws.onclose=()=>done.resolve(R.live?'dropped':'failed');
+  ws.onopen=()=>{
+    // Say hi until the host answers: it may join the relay after us.
+    ctl({t:'hi',v:1});
+    R.timers.push(setInterval(()=>{ if(!R.hello) ctl({t:'hi',v:1}); },1000));
+    R.timers.push(setInterval(()=>ctl({t:'ping',id:Date.now()}),2000));
+  };
+
+  const timer=setTimeout(()=>done.resolve('timeout'),ATTEMPT_TIMEOUT);
+  const watch=setInterval(()=>{ if(gen!==generation) done.resolve('aborted'); },250);
+  // The host may re-offer before it joins (it took our request as a knock on
+  // a live session): move to the new offer instead of waiting out the timeout.
+  R.timers.push(setInterval(async()=>{
+    if(R.live) return;
+    try{ const now=await getOffer(id); if(!now||now.session!==room.session) done.resolve('stale'); }catch{}
+  },2000));
+  let why=await done.promise;
+  clearTimeout(timer);
+  if(why!=='connected'){ clearInterval(watch); relayClose(R); return why; }
+
+  R.live=true;
+  ssSet('ooi.relay.'+code,'1');
+  onLive();
+  watchStatus('Sharing your screen · relayed','Your friend can see this now. You can minimise the tab.','ok');
+  await requestWake();
+  showPreview();
+  let lastSent=R.sent, lastFrames=R.frames;
+  R.timers.push(setInterval(()=>{
+    const kbps=Math.round((R.sent-lastSent)*8/1000), fps=R.frames-lastFrames;
+    lastSent=R.sent; lastFrames=R.frames;
+    elStats.textContent=`${R.w}×${R.h}  ${fps} fps  ${kbps} kbps  ${R.codec.toUpperCase()}\nrelayed (end-to-end encrypted)  rtt ${R.rtt} ms  target ${Math.round(R.bitrate/1000)} kbps`+
+      (R.rx?`\nyour friend: ${R.rx.fps||0} fps shown, backlog ${R.rx.q||0}`:'');
+  },1000));
+  done=deferred();
+  ws.onclose=()=>done.resolve('dropped');
+  why=await done.promise;
+  clearInterval(watch);
+  relayClose(R);
+  return 'connected';
+}
+
+function relayClose(R){
+  if(R.closed) return;
+  R.closed=true;
+  R.timers.forEach(clearInterval);
+  try{ R.reader?.cancel(); }catch{}
+  try{ R.clone?.stop(); }catch{}
+  try{ R.lastFrame?.close(); }catch{}
+  try{ R.enc && R.enc.state!=='closed' && R.enc.close(); }catch{}
+  try{ R.ws.close(); }catch{}
+}
 
 // ---- helpers --------------------------------------------------------------
 function gatherComplete(pc,ms){

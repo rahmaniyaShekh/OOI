@@ -24,6 +24,9 @@ type State struct {
 	Local       string    `json:"local_url"`
 	Started     time.Time `json:"started"`
 	Fingerprint string    `json:"cert_fingerprint,omitempty"`
+	// Args are the serve flags this instance was started with, so an update
+	// can restart it the same way.
+	Args []string `json:"args,omitempty"`
 }
 
 // ErrNotRunning means no live instance was found.

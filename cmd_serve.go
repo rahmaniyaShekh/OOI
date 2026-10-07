@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -48,6 +49,7 @@ func cmdServe(args []string) error {
 		_          = fs.Bool("detach", true, "run in the background (the default; kept for compatibility)")
 		logFile    = fs.String("log-file", "", "write the log to this file instead of the terminal")
 		quiet      = fs.Bool("quiet", false, "suppress the log stream")
+		noRelay    = fs.Bool("no-relay", false, "do not offer the encrypted relay through the rendezvous when a direct path fails")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `ooi serve - start the receiver
@@ -120,7 +122,8 @@ Capture protection is always on and cannot be disabled here.
 	return runServe(serveParams{
 		geom: g, opacity: *opacity, service: *service, order: order, threads: *threads,
 		ice: iceServers, clickThru: *clickThru, hotkeys: !*noHotkeys, gestures: !*noGesture,
-		code: joinCode, quiet: *quiet, dir: dir, logFile: *logFile,
+		code: joinCode, quiet: *quiet, dir: dir, logFile: *logFile, noRelay: *noRelay,
+		args: restartArgs(args),
 	})
 }
 
@@ -138,6 +141,29 @@ type serveParams struct {
 	quiet     bool
 	logFile   string
 	dir       string
+	noRelay   bool
+	args      []string
+}
+
+// restartArgs drops the flags that only describe how this copy was launched,
+// leaving the user's own serve flags for a restart after an update.
+func restartArgs(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a := strings.TrimLeft(args[i], "-")
+		switch {
+		case a == "foreground" || a == "foreground=true" || a == "foreground=false" ||
+			strings.HasPrefix(a, "detach") || a == "new-code" || a == "new-code=true":
+			continue
+		case a == "log-file":
+			i++ // and its value
+			continue
+		case strings.HasPrefix(a, "log-file="):
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
 }
 
 func buildICE(noStun bool, turn, user, pass string) []webrtc.ICEServer {
@@ -197,8 +223,9 @@ func runServe(p serveParams) error {
 		Sink:       ov,
 		Rz:         rz,
 		Log:        logger,
+		NoRelay:    p.noRelay,
 		OnConnect: func(st rtc.Stats) {
-			logger.Printf("connected: %s %dx%d", st.Codec, st.Width, st.Height)
+			logger.Printf("connected (%s): %s %dx%d", st.Path, st.Codec, st.Width, st.Height)
 		},
 		OnDisconnect: func() { ov.ClearFrame() },
 	})
@@ -207,9 +234,22 @@ func runServe(p serveParams) error {
 	}
 
 	// Loopback control plane for status/stop.
+	// Once a stop is requested, the process is gone within 4 s whatever
+	// happens: a clean shutdown is preferred, a hung one is not allowed.
+	var watchdog sync.Once
+	stop := func() {
+		watchdog.Do(func() {
+			go func() {
+				time.Sleep(4 * time.Second)
+				logger.Printf("shutdown took over 4s; exiting")
+				os.Exit(0)
+			}()
+		})
+		cancel()
+	}
 	ctrl, port, err := control.Start(func() control.Status {
 		return snapshot(ov, driver, p.code, rz.JoinURL(code.Pretty(p.code)))
-	}, cancel)
+	}, stop)
 	if err != nil {
 		return err
 	}
@@ -221,6 +261,7 @@ func runServe(p serveParams) error {
 		URL:     rz.JoinURL(code.Pretty(p.code)),
 		Local:   fmt.Sprintf("http://127.0.0.1:%d/", port),
 		Started: time.Now(),
+		Args:    p.args,
 	}
 	if err := procctl.Save(p.dir, st); err != nil {
 		return err
@@ -232,7 +273,9 @@ func runServe(p serveParams) error {
 	}
 
 	// Drive connections until the overlay or a signal stops us.
+	driverDone := make(chan struct{})
 	go func() {
+		defer close(driverDone)
 		if err := driver.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Printf("driver stopped: %v", err)
 		}
@@ -244,6 +287,7 @@ func runServe(p serveParams) error {
 	go func() {
 		select {
 		case <-sigc:
+			stop()
 			ov.Stop()
 		case <-ctx.Done():
 			ov.Stop()
@@ -251,7 +295,13 @@ func runServe(p serveParams) error {
 	}()
 
 	runErr := ov.Run()
-	cancel()
+	stop()
+	// Let the driver withdraw the code (bounded; the watchdog backs it up).
+	select {
+	case <-driverDone:
+	case <-time.After(2500 * time.Millisecond):
+	}
+	logger.Printf("stopped")
 	return runErr
 }
 
@@ -282,7 +332,18 @@ func snapshot(ov *overlay.Overlay, d *rtc.Driver, joinCode, link string) control
 		AffinityRestored: ov.AffinityRestored(),
 		FailClosed:       ov.FailClosedCount(),
 		LastFrameAgoMS:   lastAgo,
+		Path:             s.Path,
+		FailedJoins:      s.FailedJoins,
+		LastFailure:      s.LastFailure,
+		LastFailureAgoS:  failAgo(s.LastFailureAt),
 	}
+}
+
+func failAgo(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return int64(time.Since(t).Seconds()) + 1
 }
 
 func printBanner(p serveParams, link string) {

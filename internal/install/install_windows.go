@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -107,22 +108,37 @@ func Install(src string) (Result, error) {
 	return res, nil
 }
 
-// replaceFile installs src at dst. If dst is in use (a running ooi), it is first
-// renamed aside: Windows forbids deleting a running image but allows renaming it.
+// replaceFile installs src at dst. A running exe cannot be overwritten or
+// deleted, but it can be renamed, so dst is first moved aside to a unique
+// dst.old-<random> (a fixed name would collide with a previous update's copy
+// that is still locked). Both steps retry for up to 5 s: a process that just
+// exited, or an antivirus scan, holds the file briefly.
 func replaceFile(src, dst string) error {
-	tmp := dst + ".new"
+	var rnd [4]byte
+	rand.Read(rnd[:])
+	tmp := dst + ".new-" + hex.EncodeToString(rnd[:])
 	if err := copyFile(src, tmp); err != nil {
 		return err
 	}
-	if _, err := os.Stat(dst); err == nil {
-		old := dst + ".old"
-		os.Remove(old)
-		if err := os.Rename(dst, old); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("install: %s is locked (is ooi running? try `ooi stop`): %w", dst, err)
+	deadline := time.Now().Add(5 * time.Second)
+	retry := func(f func() error) error {
+		for {
+			err := f()
+			if err == nil || time.Now().After(deadline) {
+				return err
+			}
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
-	if err := os.Rename(tmp, dst); err != nil {
+	if _, err := os.Stat(dst); err == nil {
+		old := dst + ".old-" + hex.EncodeToString(rnd[:])
+		if err := retry(func() error { return os.Rename(dst, old) }); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("install: %s is locked: %w", dst, err)
+		}
+	}
+	if err := retry(func() error { return os.Rename(tmp, dst) }); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("install: place %s: %w", dst, err)
 	}
 	return nil
@@ -146,12 +162,18 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-// CleanupOld removes the previous executable left behind by an update, once it
-// is no longer running. Best effort.
+// CleanupOld removes previous executables left behind by updates, once they
+// are no longer running (a running one stays locked and is skipped). Best effort.
 func CleanupOld() {
-	if t, err := Target(); err == nil {
-		os.Remove(t + ".old")
-		os.Remove(t + ".new")
+	t, err := Target()
+	if err != nil {
+		return
+	}
+	for _, pat := range []string{t + ".old*", t + ".new*"} {
+		olds, _ := filepath.Glob(pat)
+		for _, o := range olds {
+			os.Remove(o)
+		}
 	}
 }
 
